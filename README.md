@@ -3,11 +3,18 @@
 Whatever vanity pet you have summoned walks to nearby corpses you or your group tapped and retrieves the loot.
 
 An [ALE](https://github.com/azerothcore/mod-ale) (Lua) script for AzerothCore.
-Drop `LootPet2.lua` into `env/dist/etc/modules/lua_scripts/` and restart the world —
+Drop `LootPet.lua` into `env/dist/etc/modules/lua_scripts/` and restart the world —
 ALE loads it at world start, so no rebuild is needed.
 
 Installed for you by [Yu'lon](https://github.com/DadsMmoLab/dads-mmo-lab) from
 this repository.
+
+## Why the file is `LootPet.lua`
+
+The repository is LootPet2; the script is `LootPet.lua`. That is deliberate. ALE loads
+**every** `.lua` in `lua_scripts/`, so a file called `LootPet2.lua` sitting beside an existing
+`LootPet.lua` would run both scripts and loot every corpse twice. Keeping the original name
+makes an upgrade an overwrite.
 
 ## Configuration
 
