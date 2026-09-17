@@ -40,11 +40,13 @@ local CONFIG = {
     --   2 = Uncommon (Green)   6 = Artifact
     --   3 = Rare (Blue)        7 = Heirloom
     --
-    -- The group's roll starts the moment the mob dies, so anything at or above
-    -- the group's loot threshold (uncommon, by default) is already being rolled
-    -- on when the pet arrives. Taking it hands the roll's item to the pet's
-    -- owner regardless of who won. 1 leaves everything from green up alone.
-    -- Raise it to 7 only on a free-for-all server, or when the party is bots.
+    -- Anything at or above the group's loot threshold (uncommon, by default)
+    -- is the core's to roll on, and the roll starts when someone first opens
+    -- the corpse. A pet that takes such an item either pre-empts the roll or,
+    -- if one is already running, leaves the winner a second copy: the roll
+    -- does not check what the pet marked. 1 leaves everything from green up
+    -- alone. Raise it to 7 only on a free-for-all server, or when the party
+    -- is bots.
     --
     -- Lowering it has a second effect worth knowing: anything left behind also
     -- blocks quest loot on that corpse, because handing quest loot over means
@@ -372,6 +374,27 @@ local function GiveItem(player, itemID, count)
     return stored
 end
 
+-- Loot:SetItemLooted marks the *first* stack with a given id and count,
+-- looted or not, so a second identical stack on the same corpse can never be
+-- reached by it. Only the first of each (id, count) is ever taken -- the twin
+-- is left for a hand loot rather than handed out twice -- and the sweep must
+-- agree with the harvest on that, or the pet walks to a twin for ever.
+-- Returns the set of entries that are the first of their kind.
+local function FirstOfKind(items)
+    local first, reachable = {}, {}
+    for _, itemData in ipairs(items or {}) do
+        local itemID = itemData.id
+        if itemID then
+            local kind = itemID .. ":" .. (itemData.count or 1)
+            if not first[kind] then
+                first[kind] = true
+                reachable[itemData] = true
+            end
+        end
+    end
+    return reachable
+end
+
 -- Items the pet marks looted stay in the list, so "empty" is counted by the
 -- flag rather than by length.
 local function AnyUnlooted(items)
@@ -516,13 +539,16 @@ local function HasLootWorthFetching(player, loot, inGroup, mayTakeQuest)
     end
 
     local questIds = QuestItemIds(loot)
+    local items = loot:GetItems()
+    local reachable = FirstOfKind(items)
 
-    for _, itemData in ipairs(loot:GetItems() or {}) do
+    for _, itemData in ipairs(items or {}) do
         local itemID = itemData.id
         if itemID and itemID > 0
            and not itemData.is_looted
            and not itemData.needs_quest
            and not questIds[itemID]
+           and reachable[itemData]
            and ShouldTakeItem(itemID, inGroup) then
             return true
         end
@@ -588,25 +614,17 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     local heldBack = false  -- something is still on the corpse for someone
     local itemsTaken = 0
 
-    -- Loot:SetItemLooted marks the *first* stack with a given id and count,
-    -- looted or not, so a second identical stack on the same corpse can never
-    -- be reached by it. Only the first of each (id, count) is taken; a twin is
-    -- left for a hand loot rather than handed out twice.
-    local firstOfKind = {}
+    local items = loot:GetItems()
+    local reachable = FirstOfKind(items)  -- see FirstOfKind
 
-    for _, itemData in ipairs(loot:GetItems() or {}) do
+    for _, itemData in ipairs(items or {}) do
         local itemID = itemData.id
         local count  = itemData.count or 1
-        local kind   = itemID and (itemID .. ":" .. count)
-
-        if kind and not firstOfKind[kind] then
-            firstOfKind[kind] = itemData
-        end
 
         if itemID and itemID > 0 and not itemData.is_looted then
             if itemData.needs_quest
                or questIds[itemID]
-               or firstOfKind[kind] ~= itemData
+               or not reachable[itemData]
                or not ShouldTakeItem(itemID, inGroup) then
                 heldBack = true
             else
