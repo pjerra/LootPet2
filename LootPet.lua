@@ -632,7 +632,14 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
 
                 if stored >= count then
                     -- Whole stack: mark it in place, the slot stays put.
+                    -- SetItemLooted does not touch loot->unlootedCount, and
+                    -- the core only de-sparkles and makes the corpse
+                    -- skinnable on release when that reaches zero
+                    -- (LootHandler.cpp, DoLootRelease), so it is kept in
+                    -- step by hand. Clamped: an item no member was allowed
+                    -- to see was never counted in.
                     loot:SetItemLooted(itemID, count, true)
+                    loot:SetUnlootedCount(math.max(0, (loot:GetUnlootedCount() or 0) - 1))
                     itemsTaken = itemsTaken + 1
                     AddToHaul(haul, itemID, stored)
                 else
