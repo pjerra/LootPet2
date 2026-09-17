@@ -397,11 +397,16 @@ end
 
 -- Items the pet marks looted stay in the list, so "empty" is counted by the
 -- flag rather than by length.
-local function AnyUnlooted(items)
+local function CountUnlooted(items)
+    local n = 0
     for _, itemData in ipairs(items or {}) do
-        if not itemData.is_looted then return true end
+        if not itemData.is_looted then n = n + 1 end
     end
-    return false
+    return n
+end
+
+local function AnyUnlooted(items)
+    return CountUnlooted(items) > 0
 end
 
 local function ShouldTakeItem(itemID, inGroup)
@@ -632,14 +637,23 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
 
                 if stored >= count then
                     -- Whole stack: mark it in place, the slot stays put.
+                    loot:SetItemLooted(itemID, count, true)
+
                     -- SetItemLooted does not touch loot->unlootedCount, and
                     -- the core only de-sparkles and makes the corpse
                     -- skinnable on release when that reaches zero
                     -- (LootHandler.cpp, DoLootRelease), so it is kept in
-                    -- step by hand. Clamped: an item no member was allowed
-                    -- to see was never counted in.
-                    loot:SetItemLooted(itemID, count, true)
-                    loot:SetUnlootedCount(math.max(0, (loot:GetUnlootedCount() or 0) - 1))
+                    -- step by hand. Not every item was counted in, though:
+                    -- one no member was allowed to see never was, while a
+                    -- multi-drop or conditional item was counted once per
+                    -- member. So the count comes down by one but never
+                    -- below the stacks still unlooted, which is the floor
+                    -- the core's own accounting can never go under. Taking
+                    -- an uncounted item then costs nothing, and the count
+                    -- still lands on zero when the last real one goes.
+                    local floor = CountUnlooted(loot:GetItems())
+                    local unlooted = loot:GetUnlootedCount() or 0
+                    loot:SetUnlootedCount(math.max(floor, unlooted - 1))
                     itemsTaken = itemsTaken + 1
                     AddToHaul(haul, itemID, stored)
                 else
