@@ -40,13 +40,16 @@ local CONFIG = {
     --   2 = Uncommon (Green)   6 = Artifact
     --   3 = Rare (Blue)        7 = Heirloom
     --
-    -- 7 is the top of the scale, so the default takes everything. That is what
-    -- you want on a free-for-all server, and whenever the party is bots.
+    -- The group's roll starts the moment the mob dies, so anything at or above
+    -- the group's loot threshold (uncommon, by default) is already being rolled
+    -- on when the pet arrives. Taking it hands the roll's item to the pet's
+    -- owner regardless of who won. 1 leaves everything from green up alone.
+    -- Raise it to 7 only on a free-for-all server, or when the party is bots.
     --
     -- Lowering it has a second effect worth knowing: anything left behind also
     -- blocks quest loot on that corpse, because handing quest loot over means
     -- clearing the whole corpse and that would take the group's roll with it.
-    MAX_QUALITY_IN_PARTY = 7,
+    MAX_QUALITY_IN_PARTY = 1,
 
     -- How often (ms) each player is checked for reachable corpses.
     SCAN_INTERVAL       = 1000,
@@ -92,17 +95,22 @@ local CONFIG = {
     -- also drops any copy a group member has not taken yet. With this off, the
     -- pet only takes quest loot nobody else in the group has a quest for.
     -- With it on, it will also take yours once the corpse has sat untouched
-    -- for PARTY_QUEST_GRACE seconds, which is long enough for the rest of the
-    -- party to have looted their own copies.
+    -- for PARTY_QUEST_GRACE seconds. Bots loot their copy within a second of
+    -- the kill; a real player who is still fighting needs long enough to walk
+    -- over, so this is measured for people, not bots.
     QUEST_LOOT_IN_PARTY = true,
-    PARTY_QUEST_GRACE   = 5,
+    PARTY_QUEST_GRACE   = 30,
 
     -- Keep a looting pet out on every real player. When none has been out
     -- for AUTO_SUMMON_DELAY seconds, the companion the player last summoned
     -- comes back -- or DEFAULT_PET_SPELL until they have summoned one.
     -- Summoning any other companion replaces it, as it always has; this only
-    -- fills the gap when there is none. Bots are left alone. 0 turns it off.
-    AUTO_SUMMON_DELAY   = 3,
+    -- fills the gap when there is none. Bots are left alone.
+    --
+    -- Off by default: dismissing a companion is the same spell cast as
+    -- summoning it, so with this on the pet came back a few seconds after
+    -- every dismissal and there was no way to put it away.
+    AUTO_SUMMON_DELAY   = 0,
     DEFAULT_PET_SPELL   = 4055,  -- Mechanical Squirrel
 
     -- Where the pet sits when it is done. Unit:MoveFollow defaults to a
@@ -121,6 +129,11 @@ local CONFIG = {
 -- by hand or an emptied corpse keeps glittering.
 local UNIT_DYNAMIC_FLAGS   = 0x0006 + 0x0049
 local UNIT_DYNFLAG_LOOTABLE = 0x0001
+
+-- ItemTemplate.Flags, from ItemTemplate.h. An item with this flag drops one
+-- copy per group member -- quest starters, most of them -- and the core keeps
+-- a per-player list of which copies are taken that Lua cannot see.
+local ITEM_FLAG_MULTI_DROP = 0x00000800
 
 -- ChatMsg and Language, from SharedDefines.h.
 local CHAT_MSG_PARTY = 0x02
@@ -321,6 +334,15 @@ end
 -- is not satisfied there, keeps going into quest_items. Never asking it to
 -- remove an ID that also exists as quest loot means it can never reach that
 -- vector, whatever the counts say.
+--
+-- The same index problem lives in loot->items. Loot:RemoveItem *erases* the
+-- entry, and every later item moves up a slot -- but PlayerFFAItems and
+-- PlayerNonQuestNonFFAConditionalItems hold slot indexes per player, exactly
+-- as PlayerQuestItems does. Erase one item from a corpse two players share
+-- and the other player's copy of a multi-drop item points at the wrong slot:
+-- it still shows in their loot window, and the server refuses it. So a whole
+-- stack is marked looted in place (Loot:SetItemLooted) and the slots never
+-- move. Loot:RemoveItem is not called on a corpse at all any more.
 local function QuestItemIds(loot)
     local ids = {}
     for _, questItem in ipairs(loot:GetQuestItems() or {}) do
@@ -350,12 +372,31 @@ local function GiveItem(player, itemID, count)
     return stored
 end
 
+-- Items the pet marks looted stay in the list, so "empty" is counted by the
+-- flag rather than by length.
+local function AnyUnlooted(items)
+    for _, itemData in ipairs(items or {}) do
+        if not itemData.is_looted then return true end
+    end
+    return false
+end
+
 local function ShouldTakeItem(itemID, inGroup)
     if not inGroup then return true end
 
     local itemTemplate = GetItemTemplate(itemID)
-    local quality = itemTemplate and itemTemplate:GetQuality() or 0
-    return quality <= CONFIG.MAX_QUALITY_IN_PARTY
+    if not itemTemplate then return false end
+
+    -- A multi-drop item is one copy per member, and which copies are taken is
+    -- kept per player where Lua cannot reach. The shared entry the pet could
+    -- mark is not any one player's copy, so in a group these are left for
+    -- each member to take by hand.
+    local flags = itemTemplate:GetFlags() or 0
+    if flags % (ITEM_FLAG_MULTI_DROP * 2) >= ITEM_FLAG_MULTI_DROP then
+        return false
+    end
+
+    return itemTemplate:GetQuality() <= CONFIG.MAX_QUALITY_IN_PARTY
 end
 
 -- Links for anything on this corpse the rarity filter will not let the pet
@@ -547,26 +588,44 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     local heldBack = false  -- something is still on the corpse for someone
     local itemsTaken = 0
 
+    -- Loot:SetItemLooted marks the *first* stack with a given id and count,
+    -- looted or not, so a second identical stack on the same corpse can never
+    -- be reached by it. Only the first of each (id, count) is taken; a twin is
+    -- left for a hand loot rather than handed out twice.
+    local firstOfKind = {}
+
     for _, itemData in ipairs(loot:GetItems() or {}) do
         local itemID = itemData.id
         local count  = itemData.count or 1
+        local kind   = itemID and (itemID .. ":" .. count)
+
+        if kind and not firstOfKind[kind] then
+            firstOfKind[kind] = itemData
+        end
 
         if itemID and itemID > 0 and not itemData.is_looted then
             if itemData.needs_quest
                or questIds[itemID]
+               or firstOfKind[kind] ~= itemData
                or not ShouldTakeItem(itemID, inGroup) then
                 heldBack = true
             else
                 local stored = GiveItem(player, itemID, count)
 
-                if stored > 0 then
-                    loot:RemoveItem(itemID, true, stored)
+                if stored >= count then
+                    -- Whole stack: mark it in place, the slot stays put.
+                    loot:SetItemLooted(itemID, count, true)
                     itemsTaken = itemsTaken + 1
                     AddToHaul(haul, itemID, stored)
-                end
-
-                if stored < count then
-                    heldBack = true  -- bags are full, or nearly
+                else
+                    -- Bags are full, or nearly. The corpse cannot be told
+                    -- about a partial take without Loot:RemoveItem, which
+                    -- may erase, so whatever was stored goes back and the
+                    -- stack stays whole on the corpse.
+                    if stored > 0 then
+                        player:RemoveItem(itemID, stored)
+                    end
+                    heldBack = true
                 end
             end
         end
@@ -619,7 +678,7 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     -- second time by hand. Otherwise clear only when the corpse is genuinely
     -- empty -- GetItems() does not report quest loot, so it is counted apart.
     local nothingLeft = (loot:GetMoney() or 0) == 0
-                        and #(loot:GetItems() or {}) == 0
+                        and not AnyUnlooted(loot:GetItems())
                         and #(loot:GetQuestItems() or {}) == 0
 
     if questTaken > 0 or nothingLeft then
@@ -791,7 +850,7 @@ local function Sweep(player)
             -- what is near where it stopped, so anything already empty is
             -- cleared here instead of waiting for a visit that is not coming.
             if loot and (loot:GetMoney() or 0) == 0
-               and #(loot:GetItems() or {}) == 0
+               and not AnyUnlooted(loot:GetItems())
                and #(loot:GetQuestItems() or {}) == 0 then
                 corpse:RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE)
             end
