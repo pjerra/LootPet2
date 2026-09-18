@@ -93,6 +93,13 @@ local CONFIG = {
     -- pull cannot produce an unreadable wall of links.
     ANNOUNCE_LOOT_MAX   = 8,
 
+    -- Turn grey (poor) items into their vendor price on the spot instead of
+    -- carrying them. This is what mod-junk-to-gold does for hand looting,
+    -- but that module hooks the loot path (OnPlayerLootItem) and the pet
+    -- puts items straight into the bags with Player:AddItem, which never
+    -- goes through it. Switch this on to get the same result for pet loot.
+    SELL_JUNK           = false,
+
     -- Quest loot can only be handed over by clearing the whole corpse, which
     -- also drops any copy a group member has not taken yet. With this off, the
     -- pet only takes quest loot nobody else in the group has a quest for.
@@ -171,6 +178,7 @@ local Tick     = {}  -- [pKey] = sweep counter
 local Petless  = {}  -- [pKey] = consecutive sweeps with no vanity pet out
 local Preferred = {} -- [pKey] = spell of the companion the player last summoned;
                      -- deliberately not cleared on login, so it survives a relog
+local Reported = {}  -- [pKey] = { [error text] = true }, said once each
 
 local HarvestLoot
 
@@ -409,6 +417,30 @@ local function AnyUnlooted(items)
     return CountUnlooted(items) > 0
 end
 
+local ITEM_QUALITY_POOR = 0
+-- MAX_MONEY_AMOUNT from Player.h. Player::ModifyMoney refuses silently past
+-- it, and the ALE binding drops the refusal.
+local MAX_MONEY = 2147483647
+
+-- The vendor price a grey would fetch under SELL_JUNK, or nil when it should
+-- go to the bags instead: not a grey, worth nothing (junk-to-gold destroys
+-- those; here they are carried so nothing vanishes unseen), or the coin
+-- would not fit under the gold cap.
+local function JunkPrice(player, itemID, count)
+    if not CONFIG.SELL_JUNK then return nil end
+
+    local itemTemplate = GetItemTemplate(itemID)
+    if not itemTemplate or itemTemplate:GetQuality() ~= ITEM_QUALITY_POOR then
+        return nil
+    end
+
+    local price = (itemTemplate:GetSellPrice() or 0) * count
+    if price <= 0 then return nil end
+    if (player:GetCoinage() or 0) + price > MAX_MONEY then return nil end
+
+    return price
+end
+
 local function ShouldTakeItem(itemID, inGroup)
     if not inGroup then return true end
 
@@ -567,6 +599,7 @@ end
 -- ============================================================================
 
 local function ClearPlayer(pKey)
+    Reported[pKey] = nil
     Fetching[pKey] = nil
     Skipped[pKey]  = nil
     Seen[pKey]     = nil
@@ -589,6 +622,23 @@ local function EndFetch(pKey, target, skip)
         Skipped[pKey] = Skipped[pKey] or {}
         Skipped[pKey][corpseKey] = (Tick[pKey] or 0) + RETRY_TICKS
     end
+end
+
+-- A Lua error inside a timed event is caught by the engine, which keeps
+-- the event alive, so a fault that repeats every sweep floods the server
+-- log and is easy to miss among the noise. Say it once per player per
+-- fault, and tell the player so a report can carry the exact line.
+local function ReportError(player, where, err)
+    local pKey = player and player:GetGUIDLow()
+    local msg  = "LootPet2 " .. where .. " error: " .. tostring(err)
+    if not pKey then print(msg) return end
+
+    Reported[pKey] = Reported[pKey] or {}
+    if Reported[pKey][msg] then return end
+    Reported[pKey][msg] = true
+
+    print(msg .. " (player " .. player:GetName() .. ")")
+    player:SendBroadcastMessage(msg)
 end
 
 -- ============================================================================
@@ -633,7 +683,17 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
                or not ShouldTakeItem(itemID, inGroup) then
                 heldBack = true
             else
-                local stored = GiveItem(player, itemID, count)
+                local stored
+                local price = JunkPrice(player, itemID, count)
+                if price then
+                    -- Coin instead of the item. Nothing enters the bags, so
+                    -- there is no full-bag case: the whole stack is sold.
+                    player:ModifyMoney(price)
+                    if haul then haul.copper = haul.copper + price end
+                    stored = count
+                else
+                    stored = GiveItem(player, itemID, count)
+                end
 
                 if stored >= count then
                     -- Whole stack: mark it in place, the slot stays put.
@@ -655,7 +715,9 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
                     local unlooted = loot:GetUnlootedCount() or 0
                     loot:SetUnlootedCount(math.max(floor, unlooted - 1))
                     itemsTaken = itemsTaken + 1
-                    AddToHaul(haul, itemID, stored)
+                    if not price then
+                        AddToHaul(haul, itemID, stored)
+                    end
                 else
                     -- Bags are full, or nearly. The corpse cannot be told
                     -- about a partial take without Loot:RemoveItem, which
@@ -937,12 +999,24 @@ local function Sweep(player)
 
     local target = { guid = best:GetGUID(), key = bestKey, polls = 0,
                      seen = bestSeen, started = tick }
-    Fetching[pKey] = target
 
     pet:MoveTo(1, best:GetX(), best:GetY(), best:GetZ())
     player:RegisterEvent(function(eventId, delay, calls, p)
-        HarvestLoot(eventId, p, target)
+        local ok, err = pcall(HarvestLoot, eventId, p, target)
+        if not ok then
+            -- A fetch that dies in the middle would otherwise keep this
+            -- event polling for good and hold Fetching until the stale
+            -- valve lets go. Stop it here, once, and say why.
+            p:RemoveEventById(eventId)
+            EndFetch(pKey, target, true)
+            SendPetToHeel(GetVanityPet(p), p)
+            ReportError(p, "fetch", err)
+        end
     end, CONFIG.ARRIVE_POLL, 0)
+
+    -- Set last: a fetch with no poll behind it would sit here until the
+    -- stale valve let go of it.
+    Fetching[pKey] = target
 end
 
 -- ============================================================================
@@ -953,7 +1027,8 @@ local function StartSweeper(player)
     if not player then return end
 
     player:RegisterEvent(function(eventId, delay, calls, p)
-        Sweep(p)
+        local ok, err = pcall(Sweep, p)
+        if not ok then ReportError(p, "sweep", err) end
     end, CONFIG.SCAN_INTERVAL, 0)
 end
 
