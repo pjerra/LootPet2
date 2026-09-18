@@ -670,7 +670,7 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     local itemsTaken = 0
 
     local items = loot:GetItems()
-    local reachable = FirstOfKind(items)  -- see FirstOfKind
+    local firstOfKind = FirstOfKind(items)  -- see FirstOfKind
 
     for _, itemData in ipairs(items or {}) do
         local itemID = itemData.id
@@ -679,7 +679,7 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
         if itemID and itemID > 0 and not itemData.is_looted then
             if itemData.needs_quest
                or questIds[itemID]
-               or not reachable[itemData]
+               or not firstOfKind[itemData]
                or not ShouldTakeItem(itemID, inGroup) then
                 heldBack = true
             else
