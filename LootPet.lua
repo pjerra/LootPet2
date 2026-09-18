@@ -418,15 +418,27 @@ local function AnyUnlooted(items)
 end
 
 local ITEM_QUALITY_POOR = 0
+-- MAX_MONEY_AMOUNT from Player.h. Player::ModifyMoney refuses silently past
+-- it, and the ALE binding drops the refusal.
+local MAX_MONEY = 2147483647
 
-local function IsJunk(itemID)
-    local itemTemplate = GetItemTemplate(itemID)
-    return itemTemplate ~= nil and itemTemplate:GetQuality() == ITEM_QUALITY_POOR
-end
+-- The vendor price a grey would fetch under SELL_JUNK, or nil when it should
+-- go to the bags instead: not a grey, worth nothing (junk-to-gold destroys
+-- those; here they are carried so nothing vanishes unseen), or the coin
+-- would not fit under the gold cap.
+local function JunkPrice(player, itemID, count)
+    if not CONFIG.SELL_JUNK then return nil end
 
-local function SellPrice(itemID)
     local itemTemplate = GetItemTemplate(itemID)
-    return itemTemplate and (itemTemplate:GetSellPrice() or 0) or 0
+    if not itemTemplate or itemTemplate:GetQuality() ~= ITEM_QUALITY_POOR then
+        return nil
+    end
+
+    local price = (itemTemplate:GetSellPrice() or 0) * count
+    if price <= 0 then return nil end
+    if (player:GetCoinage() or 0) + price > MAX_MONEY then return nil end
+
+    return price
 end
 
 local function ShouldTakeItem(itemID, inGroup)
@@ -672,14 +684,12 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
                 heldBack = true
             else
                 local stored
-                if CONFIG.SELL_JUNK and IsJunk(itemID) then
+                local price = JunkPrice(player, itemID, count)
+                if price then
                     -- Coin instead of the item. Nothing enters the bags, so
                     -- there is no full-bag case: the whole stack is sold.
-                    local price = SellPrice(itemID) * count
-                    if price > 0 then
-                        player:ModifyMoney(price)
-                        if haul then haul.copper = haul.copper + price end
-                    end
+                    player:ModifyMoney(price)
+                    if haul then haul.copper = haul.copper + price end
                     stored = count
                 else
                     stored = GiveItem(player, itemID, count)
@@ -705,7 +715,7 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
                     local unlooted = loot:GetUnlootedCount() or 0
                     loot:SetUnlootedCount(math.max(floor, unlooted - 1))
                     itemsTaken = itemsTaken + 1
-                    if not (CONFIG.SELL_JUNK and IsJunk(itemID)) then
+                    if not price then
                         AddToHaul(haul, itemID, stored)
                     end
                 else
@@ -989,7 +999,6 @@ local function Sweep(player)
 
     local target = { guid = best:GetGUID(), key = bestKey, polls = 0,
                      seen = bestSeen, started = tick }
-    Fetching[pKey] = target
 
     pet:MoveTo(1, best:GetX(), best:GetY(), best:GetZ())
     player:RegisterEvent(function(eventId, delay, calls, p)
@@ -1004,6 +1013,10 @@ local function Sweep(player)
             ReportError(p, "fetch", err)
         end
     end, CONFIG.ARRIVE_POLL, 0)
+
+    -- Set last: a fetch with no poll behind it would sit here until the
+    -- stale valve let go of it.
+    Fetching[pKey] = target
 end
 
 -- ============================================================================
