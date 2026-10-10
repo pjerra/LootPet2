@@ -122,6 +122,20 @@ local CONFIG = {
     AUTO_SUMMON_DELAY   = 0,
     DEFAULT_PET_SPELL   = 4055,  -- Mechanical Squirrel
 
+    -- A character that does not know DEFAULT_PET_SPELL is taught it when they
+    -- log in (and just before it is summoned), so the pet you configure is
+    -- there for new characters and alts without an admin command. Only a
+    -- companion spell is ever taught; anything else in DEFAULT_PET_SPELL is
+    -- left alone. Bots are skipped. Set false to leave spellbooks untouched.
+    TEACH_DEFAULT_PET   = true,
+
+    -- Split the coin the pet picks up the way the game splits group money:
+    -- equal shares among the party members who are in range of that corpse,
+    -- with whatever does not divide evenly going to the owner. Each member is
+    -- told their share. Solo it changes nothing. Set false to give the owner
+    -- all of it, as older versions did.
+    SHARE_COIN_IN_PARTY = true,
+
     -- Where the pet sits when it is done. Unit:MoveFollow defaults to a
     -- distance and angle of 0, which parks the pet inside the player.
     -- The angle is added to the player's orientation and grows counter-
@@ -153,6 +167,9 @@ local LANG_UNIVERSAL = 0
 -- SummonProperties id in EffectMiscValueB, and 41 is the companion entry
 -- (Type = SUMMON_TYPE_MINIPET) every 3.3.5 companion spell points at.
 local SPELL_EFFECT_SUMMON = 28
+
+-- LootType from Loot.h. A corpse being skinned holds this while the window is open.
+local LOOT_SKINNING = 6
 local SUMMON_PROPERTIES_COMPANION = 41
 
 local ARRIVE_LIMIT = math.max(1, math.floor(CONFIG.ARRIVE_TIMEOUT / CONFIG.ARRIVE_POLL))
@@ -224,6 +241,20 @@ local function IsCompanionSpell(spellId)
     return false
 end
 
+-- Teach a real player the configured default companion if they lack it, so a
+-- new character or alt gets the pet without an admin command. Returns nothing;
+-- a spell that is not a companion is never taught.
+local function EnsureDefaultPetKnown(player)
+    if not CONFIG.TEACH_DEFAULT_PET or player:IsBot() then return end
+
+    local spellId = CONFIG.DEFAULT_PET_SPELL
+    if not spellId or spellId <= 0 then return end
+    if player:HasSpell(spellId) then return end
+    if not IsCompanionSpell(spellId) then return end
+
+    player:LearnSpell(spellId)
+end
+
 -- Bring a companion back for a player who has none out. Counts sweeps rather
 -- than acting at once, so the brief gap while one companion is swapped for
 -- another does not get a third one summoned into the middle of it.
@@ -242,6 +273,7 @@ local function MaybeSummonPet(player, pKey)
     if gone < SUMMON_TICKS then return end
 
     Petless[pKey] = 0
+    EnsureDefaultPetKnown(player)
     player:CastSpell(player, Preferred[pKey] or CONFIG.DEFAULT_PET_SPELL, true)
 end
 
@@ -270,7 +302,7 @@ end
 -- the same cloth read as one entry, and `order` keeps them in the order they
 -- were picked up rather than whatever order pairs() feels like.
 local function NewHaul()
-    return { copper = 0, counts = {}, order = {} }
+    return { copper = 0, counts = {}, order = {}, shared = {}, sharedOrder = {} }
 end
 
 local function AddToHaul(haul, itemID, count)
@@ -295,6 +327,30 @@ local function FormatMoney(copper)
     if left > 0 or #parts == 0 then parts[#parts + 1] = left .. "c" end
 
     return table.concat(parts, " ")
+end
+
+-- Record coin handed to a party member other than the owner.
+local function AddShare(haul, member, copper)
+    if not haul or copper <= 0 then return end
+
+    local mKey = member:GetGUIDLow()
+    if not haul.shared[mKey] then
+        haul.shared[mKey] = { member = member, copper = 0 }
+        haul.sharedOrder[#haul.sharedOrder + 1] = mKey
+    end
+
+    haul.shared[mKey].copper = haul.shared[mKey].copper + copper
+end
+
+-- Tell each member what they were given. The owner's line is the haul line.
+local function AnnounceShares(player, haul)
+    if not haul then return end
+
+    for _, mKey in ipairs(haul.sharedOrder) do
+        local entry = haul.shared[mKey]
+        entry.member:SendBroadcastMessage(player:GetName() .. "'s companion shared "
+            .. FormatMoney(entry.copper) .. " of coin with you.")
+    end
 end
 
 local function AnnounceHaul(player, haul)
@@ -565,6 +621,9 @@ end
 local function HasLootWorthFetching(player, loot, inGroup, mayTakeQuest)
     if not loot then return false end
 
+    -- Being skinned right now: not ours to touch (see HarvestCorpse).
+    if loot:GetLootType() == LOOT_SKINNING then return false end
+
     if (loot:GetMoney() or 0) > 0 then return true end
 
     -- A drop we are not entitled to yet is not a reason to skip the corpse:
@@ -648,18 +707,56 @@ end
 -- Empty one corpse into the player's bags. Returns true if anything at all
 -- was taken. `age` is how many sweeps ago the corpse first came into range,
 -- which the party quest grace is measured in.
+-- Other party members who share this corpse's coin: online, in the group
+-- reward range of it, and able to hold more gold. The owner is not in the list.
+local function CoinSharers(player, corpse)
+    local out = {}
+    local group = player:GetGroup()
+    if not group then return out end
+
+    local pKey = player:GetGUIDLow()
+    for _, member in ipairs(group:GetMembers() or {}) do
+        if member:GetGUIDLow() ~= pKey and member:IsAtGroupRewardDistance(corpse) then
+            out[#out + 1] = member
+        end
+    end
+
+    return out
+end
+
 local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     local loot = corpse:GetLoot()
     if not loot then return false end
 
     local inGroup = player:IsInGroup()
 
+    -- A corpse whose loot window someone has open for skinning (or any other
+    -- non-corpse loot) is not ours. Clearing it from here resets the loot type
+    -- and the core's AllLootRemovedFromCorpse then marks the corpse skinnable
+    -- again, which is a second skin.
+    if loot:GetLootType() == LOOT_SKINNING then return false end
+
     -- 1. Money (always taken)
     local copper = loot:GetMoney() or 0
     if copper > 0 then
-        player:ModifyMoney(copper)
+        local mine = copper
+        local others
+
+        if CONFIG.SHARE_COIN_IN_PARTY and inGroup then
+            others = CoinSharers(player, corpse)
+            if #others > 0 then
+                local each = math.floor(copper / (#others + 1))
+                mine = copper - each * #others
+                for _, member in ipairs(others) do
+                    member:ModifyMoney(each)
+                    AddShare(haul, member, each)
+                end
+            end
+        end
+
+        player:ModifyMoney(mine)
         loot:SetMoney(0)
-        if haul then haul.copper = haul.copper + copper end
+        if haul then haul.copper = haul.copper + mine end
     end
 
     -- 2. Items. Each one is removed from the corpse only for the amount that
@@ -782,7 +879,12 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
                         and not AnyUnlooted(loot:GetItems())
                         and #(loot:GetQuestItems() or {}) == 0
 
-    if questTaken > 0 or nothingLeft then
+    -- Marking a corpse "all looted" makes it skinnable again, so it is only
+    -- done for a corpse the pet actually emptied. An already-skinned corpse
+    -- that holds nothing must stay unskinnable (the AoE pass visits those).
+    local tookAny = copper > 0 or itemsTaken > 0 or questTaken > 0
+
+    if questTaken > 0 or (nothingLeft and tookAny) then
         loot:Clear()
         corpse:RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE)
         corpse:AllLootRemovedFromCorpse()
@@ -868,6 +970,7 @@ HarvestLoot = function(eventId, player, target)
     end
 
     AnnounceHaul(player, haul)
+    AnnounceShares(player, haul)
     SendPetToHeel(pet, player)
 end
 
@@ -1065,6 +1168,7 @@ end
 
 local function OnLogin(event, player)
     ClearPlayer(player:GetGUIDLow())
+    EnsureDefaultPetKnown(player)
     StartSweeper(player)
 end
 
@@ -1082,6 +1186,7 @@ local ok, online = pcall(GetPlayersInWorld)
 if ok and online then
     for _, p in ipairs(online) do
         ClearPlayer(p:GetGUIDLow())
+        EnsureDefaultPetKnown(p)
         StartSweeper(p)
     end
 end
