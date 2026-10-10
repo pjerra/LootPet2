@@ -32,3 +32,11 @@ jobs:
       # fails when that line runs on the server.
       - name: luacheck
         run: luacheck $(git ls-files '*.lua')
+
+      # Drives the real HarvestCorpse and the pet preference store against a
+      # stubbed ALE, so reverting a coin-split / double-skin / chosen-pet fix fails here.
+      - name: Behaviour tests (Lua 5.1 and 5.4)
+        run: |
+          set -e
+          lua5.1 tests/harvest_test.lua
+          lua5.4 tests/harvest_test.lua

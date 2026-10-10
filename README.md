@@ -24,14 +24,15 @@ place. Yu'lon's **Tuning** tab reads and writes those keys directly.
 ### Behaviour worth knowing
 
 - **Coin is shared in a party.** Money the pet picks up is split the way the game splits group
-  money: equal shares among the party members in range of that corpse, the remainder to the
-  owner, and each member is told their share. Solo is unchanged. `SHARE_COIN_IN_PARTY = false`
+  money: equal shares among the real players in the party in range of that corpse (bots get none), the
+  remainder - and any share a full purse cannot hold - to the owner, and each member is told their share. Solo is unchanged. `SHARE_COIN_IN_PARTY = false`
   gives the owner everything, as before.
-- **`DEFAULT_PET_SPELL` is the pet you choose.** It is the companion that `AUTO_SUMMON_DELAY`
-  brings back for a player who has not summoned one yet. A character that does not know it is
-  taught it (`TEACH_DEFAULT_PET`, on by default; only companion spells are taught, bots are
-  skipped), so new characters and alts get it with no admin command. Summoning stays off until
-  `AUTO_SUMMON_DELAY` is above 0.
+- **The pet you choose follows your account.** The companion you last summoned is remembered per
+  account (table `lootpet_preferred_pet` in the characters database, created on load), so alts and
+  a server restart bring back the same pet instead of falling back to `DEFAULT_PET_SPELL`. The
+  script's own automatic summons are not remembered as a choice. `DEFAULT_PET_SPELL` is only
+  used until an account has chosen one. Automatic summoning stays off until `AUTO_SUMMON_DELAY`
+  is above 0; the summon is a triggered cast, so the character does not need to know the spell.
 - **No second skin.** The pet leaves a corpse alone while it is being skinned, and never marks an
   emptied, already-skinned corpse skinnable again.
 

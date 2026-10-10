@@ -122,16 +122,10 @@ local CONFIG = {
     AUTO_SUMMON_DELAY   = 0,
     DEFAULT_PET_SPELL   = 4055,  -- Mechanical Squirrel
 
-    -- A character that does not know DEFAULT_PET_SPELL is taught it when they
-    -- log in (and just before it is summoned), so the pet you configure is
-    -- there for new characters and alts without an admin command. Only a
-    -- companion spell is ever taught; anything else in DEFAULT_PET_SPELL is
-    -- left alone. Bots are skipped. Set false to leave spellbooks untouched.
-    TEACH_DEFAULT_PET   = true,
-
     -- Split the coin the pet picks up the way the game splits group money:
-    -- equal shares among the party members who are in range of that corpse,
-    -- with whatever does not divide evenly going to the owner. Each member is
+    -- equal shares among the real players in the party who are in range of that
+    -- corpse (bots get none), with whatever does not divide evenly -- or does
+    -- not fit in a member's purse -- going to the owner. Each member is
     -- told their share. Solo it changes nothing. Set false to give the owner
     -- all of it, as older versions did.
     SHARE_COIN_IN_PARTY = true,
@@ -193,8 +187,11 @@ local HandLooted = {} -- [pKey] = { [corpse low guid] = tick the record expires 
 local Announced = {}  -- [pKey] = { [corpse low guid] = tick the record expires }
 local Tick     = {}  -- [pKey] = sweep counter
 local Petless  = {}  -- [pKey] = consecutive sweeps with no vanity pet out
-local Preferred = {} -- [pKey] = spell of the companion the player last summoned;
-                     -- deliberately not cleared on login, so it survives a relog
+local Preferred = {} -- [account id] = spell of the companion the account last summoned,
+                     -- or false when it has none. Kept per account and written to the
+                     -- characters database, so alts and a restart get the same pet.
+                     -- Deliberately not cleared on login.
+local OwnCast  = {}  -- [pKey] = true while the script's own summon is being cast
 local Reported = {}  -- [pKey] = { [error text] = true }, said once each
 
 local HarvestLoot
@@ -241,18 +238,28 @@ local function IsCompanionSpell(spellId)
     return false
 end
 
--- Teach a real player the configured default companion if they lack it, so a
--- new character or alt gets the pet without an admin command. Returns nothing;
--- a spell that is not a companion is never taught.
-local function EnsureDefaultPetKnown(player)
-    if not CONFIG.TEACH_DEFAULT_PET or player:IsBot() then return end
+-- The companion this account last chose, read once from the database and then
+-- kept. nil when the database could not be read (try again next time).
+local function PreferredPet(player)
+    local acct = player:GetAccountId()
+    local cached = Preferred[acct]
+    if cached ~= nil then return cached or nil end
 
-    local spellId = CONFIG.DEFAULT_PET_SPELL
-    if not spellId or spellId <= 0 then return end
-    if player:HasSpell(spellId) then return end
-    if not IsCompanionSpell(spellId) then return end
+    local ok, result = pcall(CharDBQuery,
+        "SELECT spell FROM lootpet_preferred_pet WHERE account = " .. math.floor(acct))
+    if not ok then return nil end
 
-    player:LearnSpell(spellId)
+    local spell = result and result:GetUInt32(0) or 0
+    Preferred[acct] = spell > 0 and spell or false
+    return Preferred[acct] or nil
+end
+
+local function RememberPet(player, spellId)
+    local acct = player:GetAccountId()
+    if Preferred[acct] == spellId then return end
+    Preferred[acct] = spellId
+    CharDBExecute("REPLACE INTO lootpet_preferred_pet (account, spell) VALUES ("
+        .. math.floor(acct) .. ", " .. math.floor(spellId) .. ")")
 end
 
 -- Bring a companion back for a player who has none out. Counts sweeps rather
@@ -273,8 +280,13 @@ local function MaybeSummonPet(player, pKey)
     if gone < SUMMON_TICKS then return end
 
     Petless[pKey] = 0
-    EnsureDefaultPetKnown(player)
-    player:CastSpell(player, Preferred[pKey] or CONFIG.DEFAULT_PET_SPELL, true)
+    local spellId = PreferredPet(player)
+    if not spellId or not IsCompanionSpell(spellId) then spellId = CONFIG.DEFAULT_PET_SPELL end
+    -- The cast below reaches OnSpellCast like any other. It is ours, not a
+    -- choice the player made, and must not be remembered as one.
+    OwnCast[pKey] = true
+    player:CastSpell(player, spellId, true)
+    OwnCast[pKey] = nil
 end
 
 -- Deliver a line to `where` -- "player", "party" or "raid". Whenever there is
@@ -704,11 +716,8 @@ end
 -- THE HARVEST ENGINE
 -- ============================================================================
 
--- Empty one corpse into the player's bags. Returns true if anything at all
--- was taken. `age` is how many sweeps ago the corpse first came into range,
--- which the party quest grace is measured in.
--- Other party members who share this corpse's coin: online, in the group
--- reward range of it, and able to hold more gold. The owner is not in the list.
+-- Other real players in the party who share this corpse's coin: online and in
+-- the group reward range of it. Bots get nothing. The owner is not in the list.
 local function CoinSharers(player, corpse)
     local out = {}
     local group = player:GetGroup()
@@ -716,7 +725,9 @@ local function CoinSharers(player, corpse)
 
     local pKey = player:GetGUIDLow()
     for _, member in ipairs(group:GetMembers() or {}) do
-        if member:GetGUIDLow() ~= pKey and member:IsAtGroupRewardDistance(corpse) then
+        if member:GetGUIDLow() ~= pKey
+           and not member:IsBot()
+           and member:IsAtGroupRewardDistance(corpse) then
             out[#out + 1] = member
         end
     end
@@ -724,6 +735,9 @@ local function CoinSharers(player, corpse)
     return out
 end
 
+-- Empty one corpse into the player's bags. Returns true if anything at all
+-- was taken. `age` is how many sweeps ago the corpse first came into range,
+-- which the party quest grace is measured in.
 local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     local loot = corpse:GetLoot()
     if not loot then return false end
@@ -746,10 +760,15 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
             others = CoinSharers(player, corpse)
             if #others > 0 then
                 local each = math.floor(copper / (#others + 1))
-                mine = copper - each * #others
+                mine = copper
                 for _, member in ipairs(others) do
-                    member:ModifyMoney(each)
-                    AddShare(haul, member, each)
+                    -- A full purse refuses coin silently, so that share stays
+                    -- with the owner and no line claims it was given.
+                    if each > 0 and (member:GetCoinage() or 0) + each <= MAX_MONEY then
+                        member:ModifyMoney(each)
+                        AddShare(haul, member, each)
+                        mine = mine - each
+                    end
                 end
             end
         end
@@ -1158,17 +1177,16 @@ end
 -- Remember the companion a player chooses, so that is the one that comes
 -- back. Fires for every spell cast, so the cheap checks go first.
 local function OnSpellCast(event, player, spell, skipCheck)
-    if not spell or player:IsBot() then return end
+    if not spell or player:IsBot() or OwnCast[player:GetGUIDLow()] then return end
 
     local spellId = spell:GetEntry()
     if IsCompanionSpell(spellId) then
-        Preferred[player:GetGUIDLow()] = spellId
+        RememberPet(player, spellId)
     end
 end
 
 local function OnLogin(event, player)
     ClearPlayer(player:GetGUIDLow())
-    EnsureDefaultPetKnown(player)
     StartSweeper(player)
 end
 
@@ -1186,9 +1204,11 @@ local ok, online = pcall(GetPlayersInWorld)
 if ok and online then
     for _, p in ipairs(online) do
         ClearPlayer(p:GetGUIDLow())
-        EnsureDefaultPetKnown(p)
-        StartSweeper(p)
+            StartSweeper(p)
     end
 end
+
+CharDBExecute("CREATE TABLE IF NOT EXISTS lootpet_preferred_pet ("
+    .. "account INT UNSIGNED NOT NULL PRIMARY KEY, spell INT UNSIGNED NOT NULL)")
 
 print(">> LootPet2 loaded.")
