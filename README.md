@@ -24,7 +24,7 @@ place. Yu'lon's **Tuning** tab reads and writes those keys directly.
 ### Behaviour worth knowing
 
 - **Coin is shared in a party.** Money the pet picks up is split the way the game splits group
-  money: equal shares among the real players in the party in range of that corpse (bots get none), the
+  money: equal shares among the players in the party in range of that corpse (random bots get none; the player's own altbots share), the
   remainder - and any share a full purse cannot hold - to the owner, and each member is told their share. Solo is unchanged. `SHARE_COIN_IN_PARTY = false`
   gives the owner everything, as before.
 - **The pet you choose follows your account.** The companion you last summoned is remembered per

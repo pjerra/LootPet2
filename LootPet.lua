@@ -716,8 +716,35 @@ end
 -- THE HARVEST ENGINE
 -- ============================================================================
 
--- Other real players in the party who share this corpse's coin: online and in
--- the group reward range of it. Bots get nothing. The owner is not in the list.
+-- Playerbots keeps its random bots on accounts of their own. They are told
+-- apart the way Yu'lon tells them apart: the account name starts with the
+-- random-bot prefix (AiPlayerbot.RandomBotAccountPrefix, default RNDBOT), or
+-- the account is in playerbots_account_type with a random-bot type (1, 2, 3).
+-- A bot on any other account is an altbot: one of the player's own characters.
+local RANDOM_BOT_PREFIX = "RNDBOT"
+local RandomBotAccount = {} -- [account id] = true / false, asked once per account
+
+local function IsRandomBotAccount(member)
+    local acct = member:GetAccountId()
+    local cached = RandomBotAccount[acct]
+    if cached ~= nil then return cached end
+
+    local name = member:GetAccountName() or ""
+    local random = name:upper():sub(1, #RANDOM_BOT_PREFIX) == RANDOM_BOT_PREFIX
+    if not random then
+        local ok, result = pcall(CharDBQuery,
+            "SELECT 1 FROM acore_playerbots.playerbots_account_type WHERE account_id = "
+            .. math.floor(acct) .. " AND account_type IN (1, 2, 3) LIMIT 1")
+        random = ok and result ~= nil
+    end
+
+    RandomBotAccount[acct] = random
+    return random
+end
+
+-- Other members of the party who share this corpse's coin: online and in the
+-- group reward range of it. Players and altbots share; random bots get nothing.
+-- The owner is not in the list.
 local function CoinSharers(player, corpse)
     local out = {}
     local group = player:GetGroup()
@@ -726,7 +753,7 @@ local function CoinSharers(player, corpse)
     local pKey = player:GetGUIDLow()
     for _, member in ipairs(group:GetMembers() or {}) do
         if member:GetGUIDLow() ~= pKey
-           and not member:IsBot()
+           and not (member:IsBot() and IsRandomBotAccount(member))
            and member:IsAtGroupRewardDistance(corpse) then
             out[#out + 1] = member
         end

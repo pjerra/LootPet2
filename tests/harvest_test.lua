@@ -21,7 +21,8 @@ local function mkplayer(name, key, opts)
     function p:ModifyMoney(c) self.money = self.money + c end
     function p:GetCoinage() return self.money end
     function p:IsAtGroupRewardDistance() return opts.inrange ~= false end
-    function p:GetAccountId() return key end
+    function p:GetAccountId() return opts.account or key end
+    function p:GetAccountName() return opts.accname or ("PLAYER" .. key) end
     function p:RegisterEvent() end
     return p
 end
@@ -41,6 +42,8 @@ local function mkcorpse(loot_type, money)
     return c
 end
 
+local function row(v) return { GetUInt32 = function() return v end } end
+
 -- ALE globals the script touches at load time.
 local handlers = {}
 function RegisterPlayerEvent(id, fn) handlers[id] = fn end
@@ -48,11 +51,17 @@ function GetPlayersInWorld() return {} end
 function GetItemLink() return "item" end
 local executed, stored = {}, nil
 function CharDBExecute(q) executed[#executed + 1] = q end
-function CharDBQuery() return stored end
+local registry = {}   -- account id -> true when playerbots_account_type holds it
+function CharDBQuery(q)
+    if q:find("playerbots_account_type", 1, true) then
+        local id = tonumber(q:match("account_id = (%d+)"))
+        return registry[id] and row(1) or nil
+    end
+    return stored
+end
 function GetSpellInfo()
     return { HasEffect = function() return true end, GetEffectMiscValueB = function() return 41 end }
 end
-local function row(v) return { GetUInt32 = function() return v end } end
 
 local f = assert(io.open(path)); local src = f:read("*a"); f:close()
 src = src:gsub('print%(">> LootPet2 loaded%."%)', "HP_TEST = HarvestCorpse; HP_REMEMBER = RememberPet; HP_PREFERRED = PreferredPet")
@@ -72,12 +81,33 @@ end
 
 -- 1. coin
 local A, B, C, Bot = mkplayer("A", 1), mkplayer("B", 2), mkplayer("C", 3, { inrange = false }),
-                     mkplayer("Bot", 4, { bot = true })
+                     mkplayer("Bot", 4, { bot = true, accname = "RNDBOT4" })
 run(A, { A, B, C, Bot }, mkcorpse(1, 101))
 check("owner gets remainder share (51)", A.money == 51)
 check("in-range real member gets 50", B.money == 50 and #B.msgs == 1)
 check("out-of-range member gets nothing", C.money == 0 and #C.msgs == 0)
 check("bot gets nothing", Bot.money == 0 and #Bot.msgs == 0)
+
+-- altbots (the player's own characters run as bots) share; random bots do not
+A = mkplayer("A", 1)
+local Alt = mkplayer("Alt", 5, { bot = true, accname = "PERZI" })
+local Rnd = mkplayer("Rnd", 6, { bot = true, accname = "RNDBOT17" })
+local Rnd2 = mkplayer("Rnd2", 7, { bot = true, accname = "rndbot3" })
+B = mkplayer("B", 2)
+run(A, { A, B, Alt, Rnd, Rnd2 }, mkcorpse(1, 100))
+check("altbot gets an equal share (33)", Alt.money == 33 and #Alt.msgs == 1)
+check("random bot (RNDBOT account) gets nothing", Rnd.money == 0 and #Rnd.msgs == 0)
+check("random bot, lower-case prefix, gets nothing", Rnd2.money == 0 and #Rnd2.msgs == 0)
+check("human member still gets a share (33)", B.money == 33)
+check("owner shares three ways, remainder to owner (34)", A.money == 34)
+
+-- a bot on an account the registry lists is a random bot even without the prefix
+A = mkplayer("A", 1)
+local Reg = mkplayer("Reg", 8, { bot = true, accname = "SOMETHING", account = 80 })
+registry[80] = true
+run(A, { A, Reg }, mkcorpse(1, 100))
+check("registry-listed bot account gets nothing", Reg.money == 0 and A.money == 100)
+registry[80] = nil
 
 A = mkplayer("A", 1)
 run(A, nil, mkcorpse(1, 101))
