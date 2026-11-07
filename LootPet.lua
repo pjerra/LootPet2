@@ -203,7 +203,7 @@ local Skipped  = {}  -- [pKey] = { [corpse low guid] = tick at which it is retri
 local Seen     = {}  -- [pKey] = { [corpse low guid] = tick it first came into range }
 local HandLooted = {} -- [pKey] = { [corpse low guid] = tick the record expires }
 local Announced = {}  -- [pKey] = { [corpse low guid] = tick the record expires }
-local RollTried = {}  -- [pKey] = { [corpse low guid] = tick the record expires }
+local RollTried = {}  -- [pKey] = { [corpse low guid] = { tries, nextTick, done, seen = last tick the corpse was in range } }
 local Tick     = {}  -- [pKey] = sweep counter
 local Petless  = {}  -- [pKey] = consecutive sweeps with no vanity pet out
 local Preferred = {} -- [account id] = spell of the companion the account last summoned,
@@ -634,20 +634,23 @@ end
 local LOOT_METHOD_GROUP, LOOT_METHOD_NEED_BEFORE_GREED = 3, 4
 
 -- Tortoise: is there an item on this corpse that the group should roll for
--- and nobody has started yet? That is one at or above the loot threshold
--- (not is_underthreshold) that is not free for all, not under a roll
--- (is_blocked) and not already won.
+-- and nobody has started yet? That is one whose quality is at or above the
+-- group's loot threshold and that is not free for all, not quest-gated, not
+-- looted, not under a roll (is_blocked) and not already won. The quality is
+-- read from the item template: before any roll the core's is_underthreshold
+-- is false for EVERY item (greys included), so it says nothing yet.
 local function WantsRollStart(player, loot, inGroup)
     if not (TORTOISE and CONFIG.START_GROUP_ROLLS and inGroup) then return false end
 
     -- Only group loot and need before greed roll; the core's own answer for
     -- the others is false, so they are not even walked to.
     local group = player:GetGroup()
-    if not group or not group.GetLootMethod then return false end
+    if not group or not group.GetLootMethod or not group.GetLootThreshold then return false end
     local method = group:GetLootMethod()
     if method ~= LOOT_METHOD_GROUP and method ~= LOOT_METHOD_NEED_BEFORE_GREED then
         return false
     end
+    local threshold = group:GetLootThreshold()
 
     for _, itemData in ipairs(loot:GetItems() or {}) do
         local itemID = itemData.id
@@ -656,31 +659,54 @@ local function WantsRollStart(player, loot, inGroup)
            and not itemData.needs_quest
            and not itemData.freeforall
            and not itemData.is_blocked
-           and not itemData.roll_winner_guid
-           and itemData.is_underthreshold == false then
-            return true
+           and not itemData.roll_winner_guid then
+            local template = GetItemTemplate(itemID)
+            if template and (template:GetQuality() or 0) >= threshold then
+                return true
+            end
         end
     end
 
     return false
 end
 
--- Start the group's roll on this corpse, once per corpse per player. The core
--- refuses (returns false) when rolls already ran; WantsRollStart has already
--- checked the group's loot method.
+-- Rolls are asked for at most 3 times per corpse, 60 s apart (the core says
+-- false for reasons that can pass: nobody in range yet). A true answer, or the
+-- third refusal, ends it for as long as the corpse is around: the record
+-- lives until the corpse has not been seen for HANDLOOT_TICKS.
+local ROLL_TRIES = 3
+local ROLL_RETRY_TICKS = math.max(1, math.floor(60000 / CONFIG.SCAN_INTERVAL))
+
+-- May the pet (still) ask for this corpse's rolls on this sweep?
+local function RollDue(pKey, corpseKey)
+    local rec = RollTried[pKey] and RollTried[pKey][corpseKey]
+    if not rec then return true end
+    return not rec.done and (Tick[pKey] or 0) >= rec.nextTick
+end
+
 local function StartRolls(player, pKey, corpse, corpseKey, loot, inGroup)
-    local tried = RollTried[pKey]
-    if tried and tried[corpseKey] then return end
+    if not RollDue(pKey, corpseKey) then return end
     if not WantsRollStart(player, loot, inGroup) then return end
-    if not corpse.StartGroupLootRoll then return end
 
-    tried = tried or {}
+    local tried = RollTried[pKey] or {}
     RollTried[pKey] = tried
-    tried[corpseKey] = (Tick[pKey] or 0) + HANDLOOT_TICKS
+    local rec = tried[corpseKey]
+    if not rec then
+        rec = { tries = 0, nextTick = 0, done = false, seen = Tick[pKey] or 0 }
+        tried[corpseKey] = rec
+    end
 
+    if not corpse.StartGroupLootRoll then rec.done = true return end
+
+    rec.tries = rec.tries + 1
     if corpse:StartGroupLootRoll(player) then
+        rec.done = true
         print("LootPet2: " .. player:GetName() .. "'s companion started the group roll on "
             .. corpse:GetName())
+    elseif rec.tries >= ROLL_TRIES then
+        rec.done = true
+    else
+        rec.nextTick = (Tick[pKey] or 0) + ROLL_RETRY_TICKS
     end
 end
 
@@ -1211,8 +1237,9 @@ local function Sweep(player)
 
     local rolled = RollTried[pKey]
     if rolled then
-        for corpseKey, expiry in pairs(rolled) do
-            if expiry <= tick then rolled[corpseKey] = nil end
+        -- A record ends with its corpse: not seen in range for a long while.
+        for corpseKey, rec in pairs(rolled) do
+            if rec.seen + HANDLOOT_TICKS <= tick then rolled[corpseKey] = nil end
         end
     end
 
@@ -1296,8 +1323,9 @@ local function Sweep(player)
 
             local mayStartRoll = false
             if loot and TORTOISE and inGroup then
-                local tried = RollTried[pKey]
-                mayStartRoll = not (tried and tried[corpseKey])
+                local rec = RollTried[pKey] and RollTried[pKey][corpseKey]
+                if rec then rec.seen = tick end
+                mayStartRoll = RollDue(pKey, corpseKey)
                                and WantsRollStart(player, loot, inGroup)
             end
 

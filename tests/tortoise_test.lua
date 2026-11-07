@@ -17,7 +17,9 @@ local EXPORT = [[T = { TORTOISE = TORTOISE, UNIT_DYNAMIC_FLAGS = UNIT_DYNAMIC_FL
     MAX_MONEY = MAX_MONEY, Harvest = HarvestCorpse, Remember = RememberPet,
     Preferred = PreferredPet, IsCompanion = IsCompanionSpell, Sweeper = Sweeper,
     DefaultPet = CONFIG.DEFAULT_PET_SPELL,
-    SetStart = function(v) CONFIG.START_GROUP_ROLLS = v end }]]
+    SetStart = function(v) CONFIG.START_GROUP_ROLLS = v end,
+    Tick = Tick, RollTried = RollTried, RollDue = RollDue, RetryTicks = ROLL_RETRY_TICKS,
+    HandLootTicks = HANDLOOT_TICKS }]]
 local src = assert(SRC:gsub('print%(">> LootPet2 loaded%."%)', function() return EXPORT end))
 
 -- Load the script into a fresh environment. `setup(env)` adds the engine API.
@@ -230,94 +232,142 @@ run(E3, A, { GetMembers = function() return { A } end }, c)
 check("ALE: roll fields are not consulted", A.bags[2592] == 1 and A.bags[2594] == 1)
 
 -- 5b. the pet starts the group roll (Creature:StartGroupLootRoll) ---------------------
-local function rollcorpse(items, result)
+-- Before any roll the core leaves is_underthreshold false on EVERY item, greys
+-- included, so these items carry the real pre-roll value and only the quality
+-- (from the item template) against the group's threshold decides.
+local GREY, GREEN = 2589, 2594
+local function pre(id, extra)
+    local it = { id = id, count = 1, is_underthreshold = false }
+    for k, v in pairs(extra or {}) do it[k] = v end
+    return it
+end
+local function rollcorpse(items, results)
     local rc = mkcorpse(0, items)
     rc.rollcalls = 0
     function rc:GetName() return "Boar" end
     function rc:StartGroupLootRoll(who)
         self.rollcalls = self.rollcalls + 1
         self.rollwho = who
-        if result == nil then result = true end
-        return result
+        local r = results
+        if type(results) == "table" then r = results[self.rollcalls] end
+        if r == nil then r = true end
+        return r
     end
     return rc
 end
-local function lootgroup(members, method)
+local function lootgroup(members, method, threshold)
     local lg = mkgroup(members)
     function lg:GetLootMethod() return method end
+    function lg:GetLootThreshold() return threshold or 2 end
     return lg
 end
 -- one player in a group of the given loot method
-local function runas(env, key, method, target)
+local function runas(env, key, method, target, threshold)
     local who = mkplayer("A", key)
-    return run(env, who, lootgroup({ who }, method), target)
+    return run(env, who, lootgroup({ who }, method, threshold), target)
 end
-local function green(extra) return item(2594, extra or { is_underthreshold = false }) end
-local function rollenv(setup)
-    local env = load_script(function(e)
-        tortoise(e)
-        if setup then setup(e) end
-    end)
-    env.GetItemTemplate = function() return { GetFlags = function() return 0 end,
-                                              GetQuality = function() return 2 end,
-                                              GetSellPrice = function() return 0 end } end
+local function rollenv()
+    local env = load_script(tortoise)
+    env.GetItemTemplate = function(id)
+        return { GetFlags = function() return 0 end,
+                 GetQuality = function() return id == GREY and 0 or 2 end,
+                 GetSellPrice = function() return 0 end }
+    end
     return env
 end
 E = rollenv()
 A, B = mkplayer("A", 1), mkplayer("B", 2)
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 run(E, A, lootgroup({ A, B }, 3), c)
 check("roll: called once for an above-threshold item (group loot)", c.rollcalls == 1 and c.rollwho == A)
-check("roll: the pet still takes nothing rolled", (A.bags[2594] or 0) == 0 and not c.loot.items[1].is_looted)
+check("roll: the pet still takes nothing rolled", (A.bags[GREEN] or 0) == 0 and not c.loot.items[1].is_looted)
 run(E, A, lootgroup({ A, B }, 3), c)
 check("roll: the same corpse is not asked a second time", c.rollcalls == 1)
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 runas(E, 5, 4, c)
 check("roll: called for need before greed too", c.rollcalls == 1)
 
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREY) })
+runas(E, 20, 3, c)
+check("roll: a pre-roll grey (is_underthreshold false) is not rollable", c.rollcalls == 0)
+c = rollcorpse({ pre(GREEN) })
+runas(E, 21, 3, c, 3)
+check("roll: a green under a rare threshold is not rollable", c.rollcalls == 0)
+c = rollcorpse({ pre(GREEN) })
 run(E, mkplayer("A", 6), nil, c)
 check("roll: not called solo", c.rollcalls == 0)
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 runas(E, 7, 2, c)
 check("roll: not called for master loot", c.rollcalls == 0)
-c = rollcorpse({ green({ is_underthreshold = false, freeforall = true }) })
+c = rollcorpse({ pre(GREEN, { freeforall = true }) })
 runas(E, 8, 0, c)
 check("roll: not called for free for all", c.rollcalls == 0)
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 runas(E, 9, 1, c)
 check("roll: not called for round robin", c.rollcalls == 0)
-c = rollcorpse({ green({ is_underthreshold = false, is_blocked = true }) })
+c = rollcorpse({ pre(GREEN, { is_blocked = true }) })
 runas(E, 10, 3, c)
 check("roll: not called when a roll is already running", c.rollcalls == 0)
-c = rollcorpse({ green({ is_underthreshold = false, roll_winner_guid = {} }) })
+c = rollcorpse({ pre(GREEN, { roll_winner_guid = {} }) })
 runas(E, 11, 3, c)
 check("roll: not called when the item is already won", c.rollcalls == 0)
-c = rollcorpse({ item(2589) })
-runas(E, 12, 3, c)
-check("roll: not called for an item under the threshold", c.rollcalls == 0)
-c = rollcorpse({ green() }, false)
-local took5 = runas(E, 13, 3, c)
-check("roll: a refusal (false) leaves the item alone", c.rollcalls == 1 and not took5)
 
-local Eoff = rollenv(function() end)
+local Eoff = rollenv()
 Eoff.T.SetStart(false)
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 runas(Eoff, 14, 3, c)
 check("roll: not called when START_GROUP_ROLLS is off", c.rollcalls == 0)
 
 local Eale = load_script(ale)
 Eale.GetItemTemplate = E.GetItemTemplate
 A = mkplayer("A", 15)
-c = rollcorpse({ green() })
-run(Eale, A, { GetMembers = function() return { A } end, GetLootMethod = function() return 3 end }, c)
+c = rollcorpse({ pre(GREEN) })
+run(Eale, A, { GetMembers = function() return { A } end, GetLootMethod = function() return 3 end,
+               GetLootThreshold = function() return 2 end }, c)
 check("roll: ALE never calls it", c.rollcalls == 0)
 
 E = rollenv()
-c = rollcorpse({ green() })
+c = rollcorpse({ pre(GREEN) })
 c.StartGroupLootRoll = nil
 local rollok = pcall(runas, E, 16, 3, c)
 check("roll: an engine without the method is fine", rollok)
+
+-- retry policy: false is asked again twice, 60 s apart, then never again
+E = rollenv()
+local P3 = mkplayer("A", 30)
+local g3 = lootgroup({ P3 }, 3)
+c = rollcorpse({ pre(GREEN) }, false)
+local function again() run(E, P3, g3, c); return c.rollcalls end
+again()
+check("retry: first refusal is a try", c.rollcalls == 1)
+again()
+check("retry: not asked again inside 60 s", c.rollcalls == 1)
+E.T.Tick[30] = (E.T.Tick[30] or 0) + E.T.RetryTicks
+again()
+check("retry: asked a second time after 60 s", c.rollcalls == 2)
+E.T.Tick[30] = E.T.Tick[30] + E.T.RetryTicks
+again()
+check("retry: asked a third time after another 60 s", c.rollcalls == 3)
+E.T.Tick[30] = E.T.Tick[30] + E.T.RetryTicks
+again()
+check("retry: never asked a fourth time", c.rollcalls == 3)
+-- the corpse stays in range (seen refreshed by the sweep): still done after the old 300 s window
+E.T.Tick[30] = E.T.Tick[30] + E.T.HandLootTicks * 2
+E.T.RollTried[30][1].seen = E.T.Tick[30]
+check("retry: a finished corpse is not due again after 300 s", not E.T.RollDue(30, 1))
+again()
+check("retry: no walk-back or call after the old window", c.rollcalls == 3)
+-- a true answer ends it at once
+E = rollenv()
+P3 = mkplayer("A", 31)
+g3 = lootgroup({ P3 }, 3)
+c = rollcorpse({ pre(GREEN) }, { false, true })
+again()
+E.T.Tick[31] = (E.T.Tick[31] or 0) + E.T.RetryTicks
+again()
+E.T.Tick[31] = E.T.Tick[31] + E.T.RetryTicks
+again()
+check("retry: a true answer ends the asking", c.rollcalls == 2)
 
 -- 6. the sweeper starts on MAP_CHANGE, once -----------------------------------------
 local P = mkplayer("P", 10)
