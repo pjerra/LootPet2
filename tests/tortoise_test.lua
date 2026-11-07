@@ -357,6 +357,23 @@ E.T.RollTried[30][1].seen = E.T.Tick[30]
 check("retry: a finished corpse is not due again after 300 s", not E.T.RollDue(30, 1))
 again()
 check("retry: no walk-back or call after the old window", c.rollcalls == 3)
+-- a call that throws is an attempt like a refusal: 60 s apart, three in all
+E = rollenv()
+P3 = mkplayer("A", 32)
+g3 = lootgroup({ P3 }, 3)
+c = rollcorpse({ pre(GREEN) })
+local throws = 0
+function c:StartGroupLootRoll() throws = throws + 1; error("boom") end
+again()
+again()
+check("throw: one call, not retried inside 60 s", throws == 1)
+E.T.Tick[32] = (E.T.Tick[32] or 0) + E.T.RetryTicks
+again()
+E.T.Tick[32] = E.T.Tick[32] + E.T.RetryTicks
+again()
+E.T.Tick[32] = E.T.Tick[32] + E.T.RetryTicks
+again()
+check("throw: three calls in total, then none", throws == 3)
 -- a true answer ends it at once
 E = rollenv()
 P3 = mkplayer("A", 31)

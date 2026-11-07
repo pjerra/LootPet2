@@ -699,7 +699,17 @@ local function StartRolls(player, pKey, corpse, corpseKey, loot, inGroup)
     if not corpse.StartGroupLootRoll then rec.done = true return end
 
     rec.tries = rec.tries + 1
-    if corpse:StartGroupLootRoll(player) then
+    -- A call that throws counts as a refusal: an attempt, with the same gap
+    -- and cap. The error is reported once per corpse.
+    local ok, started = pcall(corpse.StartGroupLootRoll, corpse, player)
+    if not ok then
+        if not rec.errored then
+            rec.errored = true
+            print("LootPet2: starting the group roll failed (" .. tostring(started) .. ")")
+        end
+        started = false
+    end
+    if started then
         rec.done = true
         print("LootPet2: " .. player:GetName() .. "'s companion started the group roll on "
             .. corpse:GetName())
