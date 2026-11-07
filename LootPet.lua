@@ -203,6 +203,7 @@ local Preferred = {} -- [account id] = spell of the companion the account last s
                      -- Deliberately not cleared on login.
 local OwnCast  = {}  -- [pKey] = true while the script's own summon is being cast
 local Reported = {}  -- [pKey] = { [error text] = true }, said once each
+local DbWarned = false  -- Tortoise: said once per load that the database is unavailable
 local Sweeper  = {}  -- Tortoise only: [pKey] = event id of this state's sweeper
 
 local HarvestLoot
@@ -292,8 +293,21 @@ local function RememberPet(player, spellId)
     -- one cached its own, so always write.
     if not TORTOISE and Preferred[acct] == spellId then return end
     Preferred[acct] = spellId
-    CharDBExecute("REPLACE INTO lootpet_preferred_pet (account, spell) VALUES ("
-        .. math.floor(acct) .. ", " .. math.floor(spellId) .. ")")
+    local write = "REPLACE INTO lootpet_preferred_pet (account, spell) VALUES ("
+        .. math.floor(acct) .. ", " .. math.floor(spellId) .. ")"
+    if TORTOISE then
+        -- Without Eluna.UseUnsafeMethods the CharDB functions are missing or
+        -- raise. The preferred-pet feature then simply turns off.
+        if type(CharDBExecute) ~= "function" or not pcall(CharDBExecute, write) then
+            if not DbWarned then
+                DbWarned = true
+                print("LootPet2: character database unavailable "
+                    .. "(Eluna.UseUnsafeMethods = 0?); the preferred pet is not saved.")
+            end
+        end
+        return
+    end
+    CharDBExecute(write)
 end
 
 -- Bring a companion back for a player who has none out. Counts sweeps rather
@@ -1305,6 +1319,10 @@ end
 -- the sweeper is (re)started here rather than at login.
 local function OnMapChange(event, player)
     ClearPlayer(player:GetGUIDLow())
+    -- The id of a sweeper from an earlier visit is stale: the events of a state
+    -- the player left are dropped and their ids can be reused by another
+    -- script, so it must never be passed to RemoveEventById.
+    Sweeper[player:GetGUIDLow()] = nil
     StartSweeper(player)
 end
 
@@ -1344,7 +1362,7 @@ local CREATE_PREFERRED_PET = "CREATE TABLE IF NOT EXISTS lootpet_preferred_pet (
 if TORTOISE then
     -- Runs once per Lua state, which is harmless. A refusal must not stop the
     -- script from finishing its load.
-    pcall(CharDBExecute, CREATE_PREFERRED_PET)
+    if type(CharDBExecute) == "function" then pcall(CharDBExecute, CREATE_PREFERRED_PET) end
 else
     CharDBExecute(CREATE_PREFERRED_PET)
 end

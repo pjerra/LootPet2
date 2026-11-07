@@ -232,8 +232,12 @@ local P = mkplayer("P", 10)
 E = load_script(tortoise)
 E.handlers[28](28, P)
 check("MAP_CHANGE starts a sweeper", P:ActiveEvents() == 1)
+-- Leave the map: that state's events are dropped and their ids may be reused
+-- by another script. Coming back must not remove the stale id.
+P.events = {}
 E.handlers[28](28, P)
-check("a second MAP_CHANGE still leaves one sweeper", P:ActiveEvents() == 1 and #P.removed == 1)
+check("leave and return: the stale sweeper id is not removed", #P.removed == 0)
+check("leave and return: one sweeper runs", P:ActiveEvents() == 1)
 E.handlers[4](4, P)
 check("logout forgets the sweeper id", E.T.Sweeper[10] == nil)
 
@@ -304,5 +308,24 @@ E.executed = {}
 E.T.Remember(pl, 10674)
 E.T.Remember(pl, 10674)
 check("Tortoise writes the choice every time (no stale cache skip)", #E.executed == 2)
+
+-- 10. no CharDB access (Eluna.UseUnsafeMethods = 0) must not break a cast ------
+local function cast(env, who, spell)
+    return pcall(env.handlers[5], 5, who, { GetEntry = function() return spell end })
+end
+E = load_script(function(env)
+    tortoise(env)
+    env.CharDBExecute = nil
+end)
+ok = cast(E, mkplayer("C", 61), 4055)
+check("CharDBExecute missing: a companion cast does not raise", ok)
+E = load_script(function(env)
+    tortoise(env)
+    function env.CharDBExecute() error("unsafe method refused") end
+end)
+ok = cast(E, mkplayer("C", 62), 4055)
+check("CharDBExecute raising: a companion cast does not raise", ok)
+ok = pcall(E.T.Remember, mkplayer("C", 63), 4055)
+check("CharDBExecute raising: RememberPet does not raise", ok)
 
 if fails > 0 then os.exit(1) end
