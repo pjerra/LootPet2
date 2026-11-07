@@ -1216,6 +1216,8 @@ end
 
 local function Sweep(player)
     if not player then return end
+    -- Second line of defence: a sweeper started before the player was a bot.
+    if TORTOISE and player:IsBot() then return end
 
     local map = player:GetMap()
     if not map then return end
@@ -1380,6 +1382,8 @@ end
 
 local function StartSweeper(player)
     if not player then return end
+    -- Tortoise: a bot never gets a looting pet, so it never gets a sweeper.
+    if TORTOISE and player:IsBot() then return end
 
     -- Tortoise: a login and the map change that follows it must not leave two
     -- sweepers, so let go of this state's old one first.

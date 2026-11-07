@@ -69,6 +69,7 @@ What differs from AzerothCore:
 - Coin is shared with real players only: every bot, TortoiseBots bots included, gets no
   share. Only party members on the same map take part, because the group list a map
   state can read is limited to that map.
+- Bots (TortoiseBots bots) never get a looting pet: no sweeper is started for them.
 - A companion is a spell with the `SUMMON_CRITTER` effect (97); 1.12 has no summon
   properties.
 - The chosen pet is read from the database each time it is needed instead of being

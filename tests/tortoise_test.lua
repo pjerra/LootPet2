@@ -16,6 +16,7 @@ local f = assert(io.open(path)); local SRC = f:read("*a"); f:close()
 local EXPORT = [[T = { TORTOISE = TORTOISE, UNIT_DYNAMIC_FLAGS = UNIT_DYNAMIC_FLAGS,
     MAX_MONEY = MAX_MONEY, Harvest = HarvestCorpse, Remember = RememberPet,
     Preferred = PreferredPet, IsCompanion = IsCompanionSpell, Sweeper = Sweeper,
+    Sweep = Sweep,
     DefaultPet = CONFIG.DEFAULT_PET_SPELL,
     SetStart = function(v) CONFIG.START_GROUP_ROLLS = v end,
     Tick = Tick, RollTried = RollTried, RollDue = RollDue, RetryTicks = ROLL_RETRY_TICKS,
@@ -399,6 +400,47 @@ check("leave and return: the stale sweeper id is not removed", #P.removed == 0)
 check("leave and return: one sweeper runs", P:ActiveEvents() == 1)
 E.handlers[4](4, P)
 check("logout forgets the sweeper id", E.T.Sweeper[10] == nil)
+
+-- 6b. bots never get a looting pet (Tortoise) -----------------------------------------
+-- A player with a companion out, standing by a dead corpse it could loot. The
+-- counters show whether a sweep got as far as the map and the corpse scan.
+local function petted(p)
+    p.scans, p.maps = 0, 0
+    local pet = { ToUnit = function() return {} end }
+    local map = { GetWorldObject = function() return pet end }
+    function p:IsInGroup() return false end
+    function p:GetMap() self.maps = self.maps + 1; return map end
+    function p:GetCritterGUID() return 1 end
+    function p:GetCreaturesInRange() self.scans = self.scans + 1; return { p.corpse } end
+    p.corpse = mkcorpse(100)
+    function p.corpse:GetGUIDLow() return 900 end
+    function p.corpse:IsDead() return true end
+    function p.corpse:IsTappedBy() return true end
+    return p
+end
+
+E = load_script(tortoise)
+local BOT = petted(mkplayer("Bot", 70, { bot = true, accname = "SOMEPLAYER" }))
+E.handlers[28](28, BOT)
+check("a bot entering a map registers no sweeper",
+      BOT:ActiveEvents() == 0 and E.T.Sweeper[70] == nil)
+pcall(E.T.Sweep, BOT)
+check("a bot entering a map takes no loot and never scans",
+      BOT.maps == 0 and BOT.scans == 0 and BOT.money == 0 and BOT.corpse.loot.money == 100)
+
+local REAL = petted(mkplayer("Real", 71))
+E.handlers[28](28, REAL)
+check("a real player entering a map starts the sweeper", REAL:ActiveEvents() == 1)
+pcall(E.T.Sweep, REAL)
+check("a real player's sweep reaches the corpse scan", REAL.scans >= 1)
+
+local SWEPT = petted(mkplayer("Swept", 72))
+E.handlers[28](28, SWEPT)
+check("a player's sweeper is registered before it turns into a bot", SWEPT:ActiveEvents() == 1)
+function SWEPT:IsBot() return true end
+pcall(E.T.Sweep, SWEPT)
+check("a bot whose sweeper was registered: sweep returns at once and takes nothing",
+      SWEPT.maps == 0 and SWEPT.scans == 0 and SWEPT.money == 0 and SWEPT.corpse.loot.money == 100)
 
 -- 7. load loop ----------------------------------------------------------------------------
 local p1, bad, p2 = mkplayer("P1", 21), mkplayer("Bad", 22, { refused = true }), mkplayer("P2", 23)
