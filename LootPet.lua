@@ -4,6 +4,7 @@
 -- Author:   hypeer & Claude
 -- Based on: LootPet by Brytenwally (Gemini AI & User Collaboration)
 --           https://github.com/Brytenwally/Lootpet
+-- Engines:    AzerothCore (ALE) and tortoise-wow (Eluna); detected at load.
 -- Description: Whatever vanity pet you have summoned walks to nearby corpses
 --              you (or your group) tapped and retrieves the loot.
 --
@@ -140,11 +141,18 @@ local CONFIG = {
     FOLLOW_ANGLE        = math.pi / 2,
 }
 
+-- Which engine is this? One file serves both AzerothCore's ALE and
+-- tortoise-wow's Eluna (a VMaNGOS core, build 5875). The Tortoise build reports
+-- its core as "MaNGOS"; ALE reports "AzerothCore". Every Tortoise-only
+-- branch below sits behind this flag, so ALE runs exactly the code it always did.
+local TORTOISE = type(GetCoreName) == "function" and GetCoreName() == "MaNGOS"
+
 -- UNIT_DYNAMIC_FLAGS is OBJECT_END + 0x0049, and OBJECT_END is 0x0006.
 -- AllLootRemovedFromCorpse does not touch this field -- it only sets the
 -- skinnable flag and shortens corpse decay -- so the sparkle has to come off
 -- by hand or an emptied corpse keeps glittering.
-local UNIT_DYNAMIC_FLAGS   = 0x0006 + 0x0049
+-- Tortoise (vanilla 1.12, FIELD_UNIT_DYNAMIC_FLAGS in UpdateFields.h): 143.
+local UNIT_DYNAMIC_FLAGS   = TORTOISE and 143 or (0x0006 + 0x0049)
 local UNIT_DYNFLAG_LOOTABLE = 0x0001
 
 -- ItemTemplate.Flags, from ItemTemplate.h. An item with this flag drops one
@@ -161,6 +169,8 @@ local LANG_UNIVERSAL = 0
 -- SummonProperties id in EffectMiscValueB, and 41 is the companion entry
 -- (Type = SUMMON_TYPE_MINIPET) every 3.3.5 companion spell points at.
 local SPELL_EFFECT_SUMMON = 28
+-- Vanilla has no SummonProperties. A companion there is SPELL_EFFECT_SUMMON_CRITTER.
+local SPELL_EFFECT_SUMMON_CRITTER = 97
 
 -- LootType from Loot.h. A corpse being skinned holds this while the window is open.
 local LOOT_SKINNING = 6
@@ -193,6 +203,7 @@ local Preferred = {} -- [account id] = spell of the companion the account last s
                      -- Deliberately not cleared on login.
 local OwnCast  = {}  -- [pKey] = true while the script's own summon is being cast
 local Reported = {}  -- [pKey] = { [error text] = true }, said once each
+local Sweeper  = {}  -- Tortoise only: [pKey] = event id of this state's sweeper
 
 local HarvestLoot
 
@@ -226,6 +237,13 @@ end
 
 -- True if casting this spell puts a companion out.
 local function IsCompanionSpell(spellId)
+    if TORTOISE then
+        -- GetSpellInfo raises on an id it does not know, and a stale database
+        -- row would otherwise throw out of the sweep.
+        local ok, info = pcall(GetSpellInfo, spellId)
+        return ok and info ~= nil and info:HasEffect(SPELL_EFFECT_SUMMON_CRITTER) or false
+    end
+
     local info = GetSpellInfo(spellId)
     if not info or not info:HasEffect(SPELL_EFFECT_SUMMON) then return false end
 
@@ -242,6 +260,20 @@ end
 -- kept. nil when the database could not be read (try again next time).
 local function PreferredPet(player)
     local acct = player:GetAccountId()
+
+    if TORTOISE then
+        -- Every map and instance has a Lua state of its own, so a cached choice
+        -- goes stale the moment the player picks another pet elsewhere. Read it
+        -- every time; summons are rare. CharDBQuery needs
+        -- Eluna.UseUnsafeMethods = 1 there: without it, fall back silently.
+        if type(CharDBQuery) ~= "function" then return nil end
+        local ok, result = pcall(CharDBQuery,
+            "SELECT spell FROM lootpet_preferred_pet WHERE account = " .. math.floor(acct))
+        if not ok or not result then return nil end
+        local spell = result:GetUInt32(0) or 0
+        return spell > 0 and spell or nil
+    end
+
     local cached = Preferred[acct]
     if cached ~= nil then return cached or nil end
 
@@ -256,7 +288,9 @@ end
 
 local function RememberPet(player, spellId)
     local acct = player:GetAccountId()
-    if Preferred[acct] == spellId then return end
+    -- Tortoise: another state may have stored a different choice since this
+    -- one cached its own, so always write.
+    if not TORTOISE and Preferred[acct] == spellId then return end
     Preferred[acct] = spellId
     CharDBExecute("REPLACE INTO lootpet_preferred_pet (account, spell) VALUES ("
         .. math.floor(acct) .. ", " .. math.floor(spellId) .. ")")
@@ -289,6 +323,16 @@ local function MaybeSummonPet(player, pKey)
     OwnCast[pKey] = nil
 end
 
+-- The members of a group. Group:GetMembers is refused in a Tortoise map state
+-- (it is world-only there) and every hook and timer of this script runs in
+-- one, so use GetMembersOnMap: members in the world and on this state's map.
+local function GroupMembers(group)
+    if TORTOISE and group.GetMembersOnMap then
+        return group:GetMembersOnMap()
+    end
+    return group:GetMembers()
+end
+
 -- Deliver a line to `where` -- "player", "party" or "raid". Whenever there is
 -- nobody else to tell, it goes to the owner alone.
 local function Announce(player, msg, where)
@@ -302,7 +346,7 @@ local function Announce(player, msg, where)
     local isRaid = group:IsRaidGroup()
     local chatType = (where == "raid" and isRaid) and CHAT_MSG_RAID or CHAT_MSG_PARTY
 
-    for _, member in ipairs(group:GetMembers() or {}) do
+    for _, member in ipairs(GroupMembers(group) or {}) do
         -- Party chat inside a raid only reaches your own subgroup.
         if where == "raid" or not isRaid or group:SameSubGroup(player, member) then
             player:SendChatMessageToPlayer(chatType, LANG_UNIVERSAL, msg, member)
@@ -488,7 +532,8 @@ end
 local ITEM_QUALITY_POOR = 0
 -- MAX_MONEY_AMOUNT from Player.h. Player::ModifyMoney refuses silently past
 -- it, and the ALE binding drops the refusal.
-local MAX_MONEY = 2147483647
+-- Tortoise clamps to 2147483646 instead of refusing (Player.h).
+local MAX_MONEY = TORTOISE and 2147483646 or 2147483647
 
 -- The vendor price a grey would fetch under SELL_JUNK, or nil when it should
 -- go to the bags instead: not a grey, worth nothing (junk-to-gold destroys
@@ -509,8 +554,20 @@ local function JunkPrice(player, itemID, count)
     return price
 end
 
-local function ShouldTakeItem(itemID, inGroup)
+local function ShouldTakeItem(itemID, inGroup, itemData)
     if not inGroup then return true end
+
+    if TORTOISE and itemData then
+        -- Never an item that is under a roll (is_blocked), already won and
+        -- waiting for its winner (roll_winner_guid; nil when there is none),
+        -- or at or above the group's loot threshold (not is_underthreshold):
+        -- that one is rolled on the first open, and taking it either pre-empts
+        -- the roll or leaves the winner a second copy.
+        if itemData.is_blocked or itemData.roll_winner_guid
+           or itemData.is_underthreshold == false then
+            return false
+        end
+    end
 
     local itemTemplate = GetItemTemplate(itemID)
     if not itemTemplate then return false end
@@ -542,7 +599,7 @@ local function LeftBehindLinks(loot, inGroup)
            and not itemData.is_looted
            and not itemData.needs_quest
            and not questIds[itemID]
-           and not ShouldTakeItem(itemID, inGroup) then
+           and not ShouldTakeItem(itemID, inGroup, itemData) then
             links[#links + 1] = GetItemLink(itemID) or tostring(itemID)
         end
     end
@@ -582,7 +639,7 @@ local function QuestClaimants(player, corpse, corpseKey, loot)
 
     local pKey = player:GetGUIDLow()
 
-    for _, member in ipairs(group:GetMembers() or {}) do
+    for _, member in ipairs(GroupMembers(group) or {}) do
         local mKey = member:GetGUIDLow()
         local handed = HandLooted[mKey]
 
@@ -657,7 +714,7 @@ local function HasLootWorthFetching(player, loot, inGroup, mayTakeQuest)
            and not itemData.needs_quest
            and not questIds[itemID]
            and reachable[itemData]
-           and ShouldTakeItem(itemID, inGroup) then
+           and ShouldTakeItem(itemID, inGroup, itemData) then
             return true
         end
     end
@@ -742,6 +799,14 @@ local function IsRandomBotAccount(member)
     return random
 end
 
+-- A bot that gets no coin share. ALE: random bots only (altbots share). Tortoise:
+-- every bot, hired TortoiseBots bots included, since it has no account type to
+-- tell an altbot from a random one.
+local function SharesNoCoin(member)
+    if TORTOISE then return member:IsBot() end
+    return member:IsBot() and IsRandomBotAccount(member)
+end
+
 -- Other members of the party who share this corpse's coin: online and in the
 -- group reward range of it. Players and altbots share; random bots get nothing.
 -- The owner is not in the list.
@@ -751,9 +816,9 @@ local function CoinSharers(player, corpse)
     if not group then return out end
 
     local pKey = player:GetGUIDLow()
-    for _, member in ipairs(group:GetMembers() or {}) do
+    for _, member in ipairs(GroupMembers(group) or {}) do
         if member:GetGUIDLow() ~= pKey
-           and not (member:IsBot() and IsRandomBotAccount(member))
+           and not SharesNoCoin(member)
            and member:IsAtGroupRewardDistance(corpse) then
             out[#out + 1] = member
         end
@@ -823,7 +888,7 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
             if itemData.needs_quest
                or questIds[itemID]
                or not firstOfKind[itemData]
-               or not ShouldTakeItem(itemID, inGroup) then
+               or not ShouldTakeItem(itemID, inGroup, itemData) then
                 heldBack = true
             else
                 local stored
@@ -1175,10 +1240,22 @@ end
 local function StartSweeper(player)
     if not player then return end
 
-    player:RegisterEvent(function(eventId, delay, calls, p)
+    -- Tortoise: a login and the map change that follows it must not leave two
+    -- sweepers, so let go of this state's old one first.
+    if TORTOISE then
+        local pKey = player:GetGUIDLow()
+        if Sweeper[pKey] then
+            pcall(player.RemoveEventById, player, Sweeper[pKey])
+            Sweeper[pKey] = nil
+        end
+    end
+
+    local eventId = player:RegisterEvent(function(eventId, delay, calls, p)
         local ok, err = pcall(Sweep, p)
         if not ok then ReportError(p, "sweep", err) end
     end, CONFIG.SCAN_INTERVAL, 0)
+
+    if TORTOISE then Sweeper[player:GetGUIDLow()] = eventId end
 end
 
 -- Remember which corpses the player has emptied by hand.
@@ -1219,23 +1296,57 @@ end
 
 local function OnLogout(event, player)
     ClearPlayer(player:GetGUIDLow())
+    if TORTOISE then Sweeper[player:GetGUIDLow()] = nil end
 end
 
-RegisterPlayerEvent(3, OnLogin)      -- PLAYER_EVENT_ON_LOGIN
+-- Tortoise: every map and instance has its own Lua state, and a state's timed
+-- events die when the player leaves its map. PLAYER_EVENT_ON_MAP_CHANGE fires
+-- on login and on every map entry, in the state of the map being entered, so
+-- the sweeper is (re)started here rather than at login.
+local function OnMapChange(event, player)
+    ClearPlayer(player:GetGUIDLow())
+    StartSweeper(player)
+end
+
+if TORTOISE then
+    RegisterPlayerEvent(28, OnMapChange) -- PLAYER_EVENT_ON_MAP_CHANGE
+else
+    RegisterPlayerEvent(3, OnLogin)      -- PLAYER_EVENT_ON_LOGIN
+end
 RegisterPlayerEvent(4, OnLogout)     -- PLAYER_EVENT_ON_LOGOUT
 RegisterPlayerEvent(32, OnLootItem)  -- PLAYER_EVENT_ON_LOOT_ITEM
 RegisterPlayerEvent(5, OnSpellCast)   -- PLAYER_EVENT_ON_SPELL_CAST
 
 -- Pick up everyone already online, so .reload ale works without relogging.
 local ok, online = pcall(GetPlayersInWorld)
-if ok and online then
+if TORTOISE then
+    -- Never start a sweeper from the world state (it would double-sweep from
+    -- the world thread). In a map state, players on other maps are refused with
+    -- a Lua error, so each one gets its own pcall.
+    local worldState = GetStateMapId ~= nil and GetStateMapId() == -1
+    if ok and online and not worldState then
+        for _, p in ipairs(online) do
+            pcall(function()
+                ClearPlayer(p:GetGUIDLow())
+                StartSweeper(p)
+            end)
+        end
+    end
+elseif ok and online then
     for _, p in ipairs(online) do
         ClearPlayer(p:GetGUIDLow())
             StartSweeper(p)
     end
 end
 
-CharDBExecute("CREATE TABLE IF NOT EXISTS lootpet_preferred_pet ("
-    .. "account INT UNSIGNED NOT NULL PRIMARY KEY, spell INT UNSIGNED NOT NULL)")
+local CREATE_PREFERRED_PET = "CREATE TABLE IF NOT EXISTS lootpet_preferred_pet ("
+    .. "account INT UNSIGNED NOT NULL PRIMARY KEY, spell INT UNSIGNED NOT NULL)"
+if TORTOISE then
+    -- Runs once per Lua state, which is harmless. A refusal must not stop the
+    -- script from finishing its load.
+    pcall(CharDBExecute, CREATE_PREFERRED_PET)
+else
+    CharDBExecute(CREATE_PREFERRED_PET)
+end
 
 print(">> LootPet2 loaded.")
