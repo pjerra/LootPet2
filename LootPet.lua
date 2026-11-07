@@ -111,6 +111,14 @@ local CONFIG = {
     QUEST_LOOT_IN_PARTY = true,
     PARTY_QUEST_GRACE   = 30,
 
+    -- Tortoise only. When the pet reaches a corpse in a group and finds an item
+    -- at or above the group's loot threshold that nobody has rolled for yet, it
+    -- starts the group's Need/Greed roll, as the core does when a member opens
+    -- the loot window, so the group gets the roll popups without anyone walking
+    -- to the corpse. The core gives the item to the winner as usual; the pet
+    -- never takes a rolled item. Only for group loot and need before greed.
+    START_GROUP_ROLLS   = true,
+
     -- Keep a looting pet out on every real player. When none has been out
     -- for AUTO_SUMMON_DELAY seconds, the companion the player last summoned
     -- comes back -- or DEFAULT_PET_SPELL until they have summoned one.
@@ -195,6 +203,7 @@ local Skipped  = {}  -- [pKey] = { [corpse low guid] = tick at which it is retri
 local Seen     = {}  -- [pKey] = { [corpse low guid] = tick it first came into range }
 local HandLooted = {} -- [pKey] = { [corpse low guid] = tick the record expires }
 local Announced = {}  -- [pKey] = { [corpse low guid] = tick the record expires }
+local RollTried = {}  -- [pKey] = { [corpse low guid] = tick the record expires }
 local Tick     = {}  -- [pKey] = sweep counter
 local Petless  = {}  -- [pKey] = consecutive sweeps with no vanity pet out
 local Preferred = {} -- [account id] = spell of the companion the account last summoned,
@@ -621,6 +630,60 @@ local function LeftBehindLinks(loot, inGroup)
     return links
 end
 
+-- Loot methods the core rolls for (Group.h LootMethod).
+local LOOT_METHOD_GROUP, LOOT_METHOD_NEED_BEFORE_GREED = 3, 4
+
+-- Tortoise: is there an item on this corpse that the group should roll for
+-- and nobody has started yet? That is one at or above the loot threshold
+-- (not is_underthreshold) that is not free for all, not under a roll
+-- (is_blocked) and not already won.
+local function WantsRollStart(player, loot, inGroup)
+    if not (TORTOISE and CONFIG.START_GROUP_ROLLS and inGroup) then return false end
+
+    -- Only group loot and need before greed roll; the core's own answer for
+    -- the others is false, so they are not even walked to.
+    local group = player:GetGroup()
+    if not group or not group.GetLootMethod then return false end
+    local method = group:GetLootMethod()
+    if method ~= LOOT_METHOD_GROUP and method ~= LOOT_METHOD_NEED_BEFORE_GREED then
+        return false
+    end
+
+    for _, itemData in ipairs(loot:GetItems() or {}) do
+        local itemID = itemData.id
+        if itemID and itemID > 0
+           and not itemData.is_looted
+           and not itemData.needs_quest
+           and not itemData.freeforall
+           and not itemData.is_blocked
+           and not itemData.roll_winner_guid
+           and itemData.is_underthreshold == false then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Start the group's roll on this corpse, once per corpse per player. The core
+-- refuses (returns false) when rolls already ran; WantsRollStart has already
+-- checked the group's loot method.
+local function StartRolls(player, pKey, corpse, corpseKey, loot, inGroup)
+    local tried = RollTried[pKey]
+    if tried and tried[corpseKey] then return end
+    if not WantsRollStart(player, loot, inGroup) then return end
+    if not corpse.StartGroupLootRoll then return end
+
+    tried = tried or {}
+    RollTried[pKey] = tried
+    tried[corpseKey] = (Tick[pKey] or 0) + HANDLOOT_TICKS
+
+    if corpse:StartGroupLootRoll(player) then
+        print("LootPet2: " .. player:GetName() .. "'s companion started the group roll on "
+            .. corpse:GetName())
+    end
+end
+
 -- True only if there is something on this corpse we would actually take.
 -- Greens left for a group roll do not count, so the pet never walks to a
 -- corpse just to take nothing from it.
@@ -701,13 +764,16 @@ local function MayTakeQuestLoot(player, pKey, corpseKey, loot, ageTicks, unreach
     return ageTicks >= GRACE_TICKS
 end
 
-local function HasLootWorthFetching(player, loot, inGroup, mayTakeQuest)
+local function HasLootWorthFetching(player, loot, inGroup, mayTakeQuest, mayStartRoll)
     if not loot then return false end
 
     -- Being skinned right now: not ours to touch (see HarvestCorpse).
     if loot:GetLootType() == LOOT_SKINNING then return false end
 
     if (loot:GetMoney() or 0) > 0 then return true end
+
+    -- An item waiting for its group roll to be started is worth the walk.
+    if mayStartRoll then return true end
 
     -- A drop we are not entitled to yet is not a reason to skip the corpse:
     -- there may still be coin or a grey on it worth the walk.
@@ -747,6 +813,7 @@ local function ClearPlayer(pKey)
     Seen[pKey]     = nil
     HandLooted[pKey] = nil
     Announced[pKey] = nil
+    RollTried[pKey] = nil
     Tick[pKey]     = nil
     Petless[pKey]  = nil
 end
@@ -887,6 +954,14 @@ local function HarvestCorpse(player, pKey, corpse, corpseKey, age, haul)
     -- 2. Items. Each one is removed from the corpse only for the amount that
     -- actually reached the bags, so the next sweep cannot hand out a second
     -- copy and a full bag cannot make loot vanish.
+    -- Tortoise: an item at/above the loot threshold gets its group roll
+    -- started here, before the items are read, so it is already is_blocked
+    -- below and stays on the corpse for the winner.
+    if TORTOISE and inGroup then
+        local ok, err = pcall(StartRolls, player, pKey, corpse, corpseKey, loot, inGroup)
+        if not ok then ReportError(player, "start roll", err) end
+    end
+
     local questIds = QuestItemIds(loot)
     local heldBack = false  -- something is still on the corpse for someone
     local itemsTaken = 0
@@ -1134,6 +1209,13 @@ local function Sweep(player)
         end
     end
 
+    local rolled = RollTried[pKey]
+    if rolled then
+        for corpseKey, expiry in pairs(rolled) do
+            if expiry <= tick then rolled[corpseKey] = nil end
+        end
+    end
+
     -- Already walking to something -- unless that fetch has plainly died.
     local inFlight = Fetching[pKey]
     if inFlight then
@@ -1212,7 +1294,14 @@ local function Sweep(player)
                 end
             end
 
-            if HasLootWorthFetching(player, loot, inGroup, mayTakeQuest) then
+            local mayStartRoll = false
+            if loot and TORTOISE and inGroup then
+                local tried = RollTried[pKey]
+                mayStartRoll = not (tried and tried[corpseKey])
+                               and WantsRollStart(player, loot, inGroup)
+            end
+
+            if HasLootWorthFetching(player, loot, inGroup, mayTakeQuest, mayStartRoll) then
                 local dist = player:GetDistance(corpse)
                 if not bestDist or dist < bestDist then
                     best, bestKey, bestDist, bestSeen = corpse, corpseKey, dist, firstSeen

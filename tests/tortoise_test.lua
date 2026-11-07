@@ -16,7 +16,8 @@ local f = assert(io.open(path)); local SRC = f:read("*a"); f:close()
 local EXPORT = [[T = { TORTOISE = TORTOISE, UNIT_DYNAMIC_FLAGS = UNIT_DYNAMIC_FLAGS,
     MAX_MONEY = MAX_MONEY, Harvest = HarvestCorpse, Remember = RememberPet,
     Preferred = PreferredPet, IsCompanion = IsCompanionSpell, Sweeper = Sweeper,
-    DefaultPet = CONFIG.DEFAULT_PET_SPELL }]]
+    DefaultPet = CONFIG.DEFAULT_PET_SPELL,
+    SetStart = function(v) CONFIG.START_GROUP_ROLLS = v end }]]
 local src = assert(SRC:gsub('print%(">> LootPet2 loaded%."%)', function() return EXPORT end))
 
 -- Load the script into a fresh environment. `setup(env)` adds the engine API.
@@ -227,6 +228,96 @@ A = mkplayer("A", 1)
 c = mkcorpse(0, quality_items())
 run(E3, A, { GetMembers = function() return { A } end }, c)
 check("ALE: roll fields are not consulted", A.bags[2592] == 1 and A.bags[2594] == 1)
+
+-- 5b. the pet starts the group roll (Creature:StartGroupLootRoll) ---------------------
+local function rollcorpse(items, result)
+    local rc = mkcorpse(0, items)
+    rc.rollcalls = 0
+    function rc:GetName() return "Boar" end
+    function rc:StartGroupLootRoll(who)
+        self.rollcalls = self.rollcalls + 1
+        self.rollwho = who
+        if result == nil then result = true end
+        return result
+    end
+    return rc
+end
+local function lootgroup(members, method)
+    local lg = mkgroup(members)
+    function lg:GetLootMethod() return method end
+    return lg
+end
+-- one player in a group of the given loot method
+local function runas(env, key, method, target)
+    local who = mkplayer("A", key)
+    return run(env, who, lootgroup({ who }, method), target)
+end
+local function green(extra) return item(2594, extra or { is_underthreshold = false }) end
+local function rollenv(setup)
+    local env = load_script(function(e)
+        tortoise(e)
+        if setup then setup(e) end
+    end)
+    env.GetItemTemplate = function() return { GetFlags = function() return 0 end,
+                                              GetQuality = function() return 2 end,
+                                              GetSellPrice = function() return 0 end } end
+    return env
+end
+E = rollenv()
+A, B = mkplayer("A", 1), mkplayer("B", 2)
+c = rollcorpse({ green() })
+run(E, A, lootgroup({ A, B }, 3), c)
+check("roll: called once for an above-threshold item (group loot)", c.rollcalls == 1 and c.rollwho == A)
+check("roll: the pet still takes nothing rolled", (A.bags[2594] or 0) == 0 and not c.loot.items[1].is_looted)
+run(E, A, lootgroup({ A, B }, 3), c)
+check("roll: the same corpse is not asked a second time", c.rollcalls == 1)
+c = rollcorpse({ green() })
+runas(E, 5, 4, c)
+check("roll: called for need before greed too", c.rollcalls == 1)
+
+c = rollcorpse({ green() })
+run(E, mkplayer("A", 6), nil, c)
+check("roll: not called solo", c.rollcalls == 0)
+c = rollcorpse({ green() })
+runas(E, 7, 2, c)
+check("roll: not called for master loot", c.rollcalls == 0)
+c = rollcorpse({ green({ is_underthreshold = false, freeforall = true }) })
+runas(E, 8, 0, c)
+check("roll: not called for free for all", c.rollcalls == 0)
+c = rollcorpse({ green() })
+runas(E, 9, 1, c)
+check("roll: not called for round robin", c.rollcalls == 0)
+c = rollcorpse({ green({ is_underthreshold = false, is_blocked = true }) })
+runas(E, 10, 3, c)
+check("roll: not called when a roll is already running", c.rollcalls == 0)
+c = rollcorpse({ green({ is_underthreshold = false, roll_winner_guid = {} }) })
+runas(E, 11, 3, c)
+check("roll: not called when the item is already won", c.rollcalls == 0)
+c = rollcorpse({ item(2589) })
+runas(E, 12, 3, c)
+check("roll: not called for an item under the threshold", c.rollcalls == 0)
+c = rollcorpse({ green() }, false)
+local took5 = runas(E, 13, 3, c)
+check("roll: a refusal (false) leaves the item alone", c.rollcalls == 1 and not took5)
+
+local Eoff = rollenv(function() end)
+Eoff.T.SetStart(false)
+c = rollcorpse({ green() })
+runas(Eoff, 14, 3, c)
+check("roll: not called when START_GROUP_ROLLS is off", c.rollcalls == 0)
+
+local Eale = load_script(ale)
+Eale.GetItemTemplate = E.GetItemTemplate
+A = mkplayer("A", 15)
+c = rollcorpse({ green() })
+run(Eale, A, { GetMembers = function() return { A } end, GetLootMethod = function() return 3 end }, c)
+check("roll: ALE never calls it", c.rollcalls == 0)
+
+E = rollenv()
+c = rollcorpse({ green() })
+c.StartGroupLootRoll = nil
+local rollok = pcall(runas, E, 16, 3, c)
+check("roll: an engine without the method is fine", rollok)
 
 -- 6. the sweeper starts on MAP_CHANGE, once -----------------------------------------
 local P = mkplayer("P", 10)

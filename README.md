@@ -62,6 +62,10 @@ What differs from AzerothCore:
 - In a group the pet never takes an item that is under a roll, already won and waiting
   for its winner, or at or above the group's loot threshold, whatever `MAX_QUALITY_IN_PARTY`
   says. Those stay on the corpse for the roll.
+- With `START_GROUP_ROLLS` (default true) and group loot or need before greed, the pet
+  starts the group's roll on an item at or above the threshold when it reaches the corpse
+  (`Creature:StartGroupLootRoll`, patch 0011), so the group gets the roll popups without
+  anyone walking over. The core gives the item to the winner; the pet never takes it.
 - Coin is shared with real players only: every bot, TortoiseBots bots included, gets no
   share. Only party members on the same map take part, because the group list a map
   state can read is limited to that map.
