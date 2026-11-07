@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Lua 5.1, Lua 5.4 and luacheck
+      - name: Install Lua 5.1, 5.2, 5.4 and luacheck
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq lua5.1 lua5.4 lua-check
+          sudo apt-get install -y -qq lua5.1 lua5.2 lua5.4 lua-check
 
       # ALE runs whichever Lua the server was built with; a script has to
       # parse under the oldest and the newest.
@@ -21,6 +21,12 @@ jobs:
         run: |
           set -e
           for f in $(git ls-files '*.lua'); do luac5.1 -p "$f"; echo "ok 5.1 $f"; done
+
+      # tortoise-wow's Eluna build links Lua 5.2 by default.
+      - name: Compile under Lua 5.2
+        run: |
+          set -e
+          for f in $(git ls-files '*.lua'); do luac5.2 -p "$f"; echo "ok 5.2 $f"; done
 
       - name: Compile under Lua 5.4
         run: |
@@ -35,8 +41,11 @@ jobs:
 
       # Drives the real HarvestCorpse and the pet preference store against a
       # stubbed ALE, so reverting a coin-split / double-skin / chosen-pet fix fails here.
-      - name: Behaviour tests (Lua 5.1 and 5.4)
+      # tortoise_test.lua does the same for the tortoise-wow (Eluna) branches.
+      - name: Behaviour tests (Lua 5.1, 5.2 and 5.4)
         run: |
           set -e
-          lua5.1 tests/harvest_test.lua
-          lua5.4 tests/harvest_test.lua
+          for v in 5.1 5.2 5.4; do
+            lua$v tests/harvest_test.lua
+            lua$v tests/tortoise_test.lua
+          done
