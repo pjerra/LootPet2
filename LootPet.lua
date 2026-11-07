@@ -121,7 +121,7 @@ local CONFIG = {
     -- summoning it, so with this on the pet came back a few seconds after
     -- every dismissal and there was no way to put it away.
     AUTO_SUMMON_DELAY   = 0,
-    DEFAULT_PET_SPELL   = 4055,  -- Mechanical Squirrel
+    DEFAULT_PET_SPELL   = 28738,  -- Speedy (Turtle Box, item 23002)
 
     -- Split the coin the pet picks up the way the game splits group money:
     -- equal shares among the real players in the party who are in range of that

@@ -15,7 +15,8 @@ end
 local f = assert(io.open(path)); local SRC = f:read("*a"); f:close()
 local EXPORT = [[T = { TORTOISE = TORTOISE, UNIT_DYNAMIC_FLAGS = UNIT_DYNAMIC_FLAGS,
     MAX_MONEY = MAX_MONEY, Harvest = HarvestCorpse, Remember = RememberPet,
-    Preferred = PreferredPet, IsCompanion = IsCompanionSpell, Sweeper = Sweeper }]]
+    Preferred = PreferredPet, IsCompanion = IsCompanionSpell, Sweeper = Sweeper,
+    DefaultPet = CONFIG.DEFAULT_PET_SPELL }]]
 local src = assert(SRC:gsub('print%(">> LootPet2 loaded%."%)', function() return EXPORT end))
 
 -- Load the script into a fresh environment. `setup(env)` adds the engine API.
@@ -45,7 +46,7 @@ local function tortoise(env)
     function env.GetStateMapId() return 0 end
     function env.GetSpellInfo(id)
         if id == 99999 then error("unknown spell id") end
-        return { HasEffect = function(_, e) return e == 97 and id == 4055 end }
+        return { HasEffect = function(_, e) return e == 97 and (id == 4055 or id == 28738) end }
     end
     function env.GetItemTemplate(id)
         return { GetFlags = function() return 0 end,
@@ -269,6 +270,8 @@ check("ALE load loop still starts a sweeper for everyone online", a1:ActiveEvent
 E = load_script(tortoise)
 check("a companion is detected by effect 97", E.T.IsCompanion(4055) == true)
 check("a non-companion spell is not", E.T.IsCompanion(100) == false)
+check("the default pet is Speedy (28738) and is a companion", E.T.DefaultPet == 28738
+    and E.T.IsCompanion(E.T.DefaultPet) == true)
 local ok, res = pcall(E.T.IsCompanion, 99999)
 check("an unknown spell id does not throw", ok and res == false)
 
